@@ -1,0 +1,47 @@
+name: Hexscale CI & Build
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake build-essential libvulkan-dev glslang-tools libwayland-dev
+
+      - name: Configure CMake
+        run: cmake -B build -S . -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build Binaries (Daemon, CLI, Vulkan Layer)
+        run: cmake --build build --parallel $(nproc)
+
+      - name: Run Standalone Latency Benchmark
+        run: ./build/cli/hexscale-cli --bench 50
+
+      - name: Package Decky Plugin
+        run: |
+          mkdir -p build/dist/hexscale
+          cp -r decky/* build/dist/hexscale/
+          cd build/dist && zip -r hexscale-decky-plugin.zip hexscale
+
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: hexscale-binaries
+          path: |
+            build/daemon/hexscaled
+            build/cli/hexscale-cli
+            build/layer/libVkLayer_hexscale.so
+            build/layer/VkLayer_hexscale.json
+            build/dist/hexscale-decky-plugin.zip
