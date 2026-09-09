@@ -62,13 +62,24 @@ public:
     // Invoke remote method on Hexagon CDSP
     bool invoke(uint32_t handle, uint32_t sc, std::span<FastRpcRemoteArg> args);
 
-    // Set performance voting / power level
+    // Set performance voting / power level on per-PD domains (NSP, CX, MXC)
     bool set_performance_profile(uint32_t profile);
+
+    // Hardware status inspection
+    [[nodiscard]] bool is_dma_coherent() const { return m_dma_coherent; }
+    [[nodiscard]] bool is_qda_drm_accel() const { return m_using_qda; }
+    [[nodiscard]] const std::string& get_backend_driver() const { return m_driver_name; }
 
 private:
     int m_fd{-1};
     std::string m_dev_path;
+    std::string m_driver_name{"fastrpc"};
+    bool m_using_qda{false};
+    bool m_dma_coherent{false};
+    std::string m_devfreq_node;
     std::vector<FastRpcMemoryMapping> m_active_mappings;
+
+    void probe_hardware_capabilities();
 };
 
 } // namespace hexscale::fastrpc
