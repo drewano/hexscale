@@ -1,0 +1,10 @@
+{
+  "name": "Hexscale",
+  "author": "drewano",
+  "flags": ["root"],
+  "version": "0.1.0",
+  "description": "Qualcomm Hexagon NPU Super-Resolution & Neural Upscaling for SteamOS",
+  "publish": {
+    "tags": ["performance", "display", "npu", "qualcomm", "upscaling"]
+  }
+}

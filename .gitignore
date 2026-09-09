@@ -1,0 +1,26 @@
+# Build directories
+build/
+bin/
+lib/
+*.o
+*.a
+*.so
+*.dylib
+
+# Binaries
+hexscaled
+hexscale-cli
+libVkLayer_hexscale.so
+
+# Node / Decky
+node_modules/
+dist/
+*.pyc
+__pycache__/
+.venv/
+
+# IDE / OS
+.DS_Store
+compile_commands.json
+.vscode/
+.idea/

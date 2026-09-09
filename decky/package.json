@@ -1,0 +1,23 @@
+{
+  "name": "hexscale-decky",
+  "version": "0.1.0",
+  "description": "Qualcomm Hexagon NPU Super-Resolution & Neural Upscaling for SteamOS",
+  "scripts": {
+    "build": "rollup -c",
+    "watch": "rollup -c -w"
+  },
+  "dependencies": {
+    "decky-frontend-lib": "^3.24.1",
+    "react": "^18.2.0",
+    "react-icons": "^4.10.1"
+  },
+  "devDependencies": {
+    "@rollup/plugin-commonjs": "^24.0.1",
+    "@rollup/plugin-node-resolve": "^15.0.1",
+    "@rollup/plugin-typescript": "^11.0.0",
+    "@types/react": "^18.0.28",
+    "rollup": "^3.18.0",
+    "tslib": "^2.5.0",
+    "typescript": "^5.0.2"
+  }
+}
