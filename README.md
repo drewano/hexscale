@@ -1,137 +1,108 @@
 # hexscale
 
-**Offloading Neural Super-Resolution and Frame Generation to Qualcomm Hexagon NPUs under Mainline Linux & SteamOS.**
+Real-time neural upscaling on Qualcomm Hexagon NPUs (CDSP/HTP) for Linux handhelds.
 
-`hexscale` is an open-source, hardware-accelerated project designed to offload real-time neural upscaling (super-resolution) and frame interpolation to the Qualcomm Hexagon Compute DSP / NPU (CDSP) on Snapdragon SoCs (specifically the **Snapdragon 8 Gen 2 / SM8550** on the **AYN Odin 2**) running mainline Linux and SteamOS-like environments ([Armada OS](https://github.com/armada-os/armada)).
-
----
-
-## The Core Philosophy: "Zero GPU Penalty"
-
-Handheld gaming consoles based on ARM64 SoCs operate under constrained thermal and electrical budgets (typically 5W to 15W total package power):
-
-1. **GPU Starvation with Existing Upscalers**: Running traditional neural or compute-shader upscalers (like FSR, NIS, or Lossless Scaling LSFG) on mobile GPUs (e.g., Adreno 740) steals **20% to 35% of shader capacity**. If a game is already pushing the GPU to 100% to maintain 30 FPS, enabling GPU upscalers drops the base game's framerate, introducing severe stutter.
-2. **Untapped Coprocessors**: The SoC integrates a dedicated **Hexagon 790 Tensor Processor (HTP v73)** capable of ~15 INT8 TOPS. In gaming today, this silicon is **0% utilized (dormant)**.
-3. **The Solution**: By routing frames directly between Vulkan and the CDSP via zero-copy `dma-buf` descriptors, `hexscale` executes neural upscaling on the NPU in **sub-millisecond latency (< 1 ms)**, leaving **100% of the GPU shader budget free for the game** while saving significant battery power.
+`hexscale` offloads super-resolution inference from the GPU to the Qualcomm Hexagon Tensor Processor (HTP) on Snapdragon SoCs (SM8550 / AYN Odin 2, SM8650, SM8750). Frames are routed between Vulkan and the CDSP via zero-copy `dma-buf` sharing, eliminating GPU shader overhead for spatial upscaling.
 
 ---
 
-## Architecture Overview
+## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│               Game / Emulator (e.g. 720p @ 60 FPS)              │
-│               Renders via Vulkan (Mesa Turnip / Adreno)         │
-└────────────────────────────────┬────────────────────────────────┘
-                                 │ vkQueuePresentKHR
-                                 ▼
-┌─────────────────────────────────────────────────────────────────┐
-│               Vulkan Layer (VK_LAYER_HEXSCALE)                  │
-│               Exports VkImage as dma-buf descriptor             │
-└────────────────────────────────┬────────────────────────────────┘
-                                 │ IPC / Zero-Copy Memory Map
-                                 ▼
-┌─────────────────────────────────────────────────────────────────┐
-│               Hexscale Daemon (hexscaled C++20)                 │
-│               Controls /dev/fastrpc-cdsp & preloaded QNN context│
-└────────────────────────────────┬────────────────────────────────┘
-                                 │ FastRPC Bus
-                                 ▼
-┌─────────────────────────────────────────────────────────────────┐
-│               Qualcomm Hexagon 790 NPU (HTP v73)                │
-│    Executes XLSR-x1.5 INT8 (W8A8) in < 1.0 ms                   │
-│    (Hexagon Tensor Processor / HVX Vector Pipeline)             │
-└────────────────────────────────┬────────────────────────────────┘
-                                 │ 1080p Upscaled Frame Buffer
-                                 ▼
-┌─────────────────────────────────────────────────────────────────┐
-│               Gamescope / Wayland Compositor (1080p)            │
-│               Presented directly to Odin 2 Display              │
-└─────────────────────────────────────────────────────────────────┘
-                                 ▲
-                                 │ Real-time Socket IPC
-┌────────────────────────────────┴────────────────────────────────┐
-│               Decky Loader Plugin (SteamOS QAM)                 │
-│   Toggles ON/OFF, Sharpness Slider, NPU Telemetry & Profiles    │
-└─────────────────────────────────────────────────────────────────┘
+Game / Emulator (Vulkan)
+       │
+       │ vkQueuePresentKHR
+       ▼
+VK_LAYER_HEXSCALE (Vulkan Layer)
+       │
+       │ dma-buf export + Unix socket IPC
+       ▼
+hexscaled (C++20 daemon)
+       │
+       │ FastRPC (/dev/fastrpc-cdsp) or DRM QDA (/dev/accel/accel0)
+       ▼
+Qualcomm Hexagon HTP (INT8 Tensor Execution)
+       │
+       │ Upscaled buffer
+       ▼
+Gamescope / Wayland Compositor (scanout)
 ```
 
----
+### Components
 
-## Repository Structure
-
-* **`daemon/` (`hexscaled`)**: Resident C++20 background service. Manages the `/dev/fastrpc-cdsp` session, keeps the XLSR context binary resident in Hexagon L2/TCM memory, and listens on `/run/hexscale/control.sock`.
-* **`cli/` (`hexscale-cli`)**: Standalone benchmark and control utility. Allows benchmarking inference latency in microsecond precision and testing upscaling without running a game.
-* **`layer/` (`VK_LAYER_HEXSCALE`)**: Vulkan explicit layer that intercepts swapchain presentations and coordinates zero-copy `dma-buf` exchange.
-* **`decky/`**: Native Steam Deck / SteamOS Quick Access Menu (QAM) plugin built with React, TypeScript, and Python.
-* **`models/`**: Scripts and recipes to convert and quantize models (e.g. XLSR, SESR) for the Qualcomm Hexagon Tensor Processor.
-* **`scripts/`**: Systemd unit files (`hexscaled.service`) and build automation.
+* **`daemon/` (`hexscaled`)**: C++20 daemon that maintains the FastRPC / QDA session, keeps the QNN model context resident in Hexagon TCM/L2 memory, maps `dma-buf` file descriptors into CDSP SMMU space, and handles IPC over `/run/hexscale/control.sock`.
+* **`layer/` (`VK_LAYER_HEXSCALE`)**: Vulkan explicit layer that intercepts `vkQueuePresentKHR`, exports swapchain images as `dma-buf` handles, and synchronizes presentation with `hexscaled`.
+* **`cli/` (`hexscale-cli`)**: Benchmark and debugging utility for testing inference latency, memory mapping overhead, and IPC round-trips without launching a game.
+* **`decky/`**: Decky Loader plugin providing toggles, sharpness adjustments, and power profiles directly in the SteamOS Quick Access Menu (QAM).
+* **`models/`**: Conversion tooling (`convert_qnn.py`) to compile ONNX super-resolution models into QNN context binaries for HTP targets.
 
 ---
 
-## Active Target Models
+## Quantization & HTP Throughput
 
-### 1. Super-Resolution: **XLSR (Extremely Lightweight Super-Resolution)**
-* **Origin**: Qualcomm AI Hub (official Snapdragon NPU model).
-* **Quantization**: INT8 (W8A8).
-* **Size**: **~45.6 KB**.
-* **Measured Latency on NPU**: **< 1.0 ms** (1280x720 ➔ 1920x1080).
-* **Power Draw**: < 1.0 Watt on Hexagon HTP.
+The Hexagon Tensor Processor (HTP v73 on SM8550) achieves its rated throughput strictly with symmetric **INT8** quantization (`W8A8`).
 
-### 2. Frame Generation (Phase 2): **ANVIL / Hybrid Optical Flow**
-* **Origin**: Research paper *ANVIL: Accelerator-Native Video Interpolation* (arXiv:2603.26835).
-* **Architecture**: GPU Vulkan compute shader for coarse motion vector smoothing + Hexagon NPU UNet-v3b for neural residual synthesis in INT8.
+* **Unquantized models (FP32 / FP16)**: Fall back to scalar DSP emulation, leading to high latency and frame drops.
+* **INT8 quantized models (e.g. XLSR, QuickSRNet)**: Run natively on HTP tensor units with sub-millisecond execution times (< 1 ms for 720p $\to$ 1080p) and minimal package power draw (< 1W).
 
 ---
 
-## Building and Testing
+## Kernel Requirements
 
-### Requirements
-* C++20 compatible compiler (`g++` or `clang++`)
+1. **Qualcomm FastRPC**: `CONFIG_QCOM_FASTRPC=m` (or `=y`), with `/dev/fastrpc-cdsp` accessible, or the DRM QDA driver (`/dev/accel/accel0`).
+2. **CDSP Power Domain Scaling**: Kernel support for CDSP per-PD proxy performance states (Mukesh Ojha's upstream series, see [armada-packages#66](https://github.com/armada-os/armada-packages/pull/66)). Without this, the CDSP cannot scale up from its lowest idle frequency state.
+3. **DMA-BUF Sharing**: `CONFIG_DMA_SHARED_BUFFER=y` for zero-copy buffer handoff between Turnip (Vulkan) and the CDSP SMMU.
+
+---
+
+## Building
+
+### Dependencies
+* C++20 compiler (`gcc` >= 13 or `clang` >= 16)
 * CMake >= 3.20
-* Vulkan SDK headers
-* (Optional) Qualcomm AI Engine Direct (QNN) SDK for Snapdragon hardware compilation
+* Vulkan headers and loader (`libvulkan-dev`)
+* DRM development headers (`libdrm-dev`)
+* (Optional) Qualcomm QNN SDK (for compiling context binaries from source)
 
-### Build Instructions
+### Compilation
+
 ```bash
 git clone https://github.com/drewano/hexscale.git
 cd hexscale
-cmake -B build -S . -DCMAKE_BUILD_TYPE=Release
+cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j$(nproc)
-```
-
-### Running the Standalone Benchmark
-```bash
-./build/cli/hexscale-cli --bench 200
-```
-
-### Querying Daemon Status
-```bash
-./build/cli/hexscale-cli --status
-```
-
-### Starting the System Daemon
-```bash
-sudo systemctl enable --now hexscaled.service
 ```
 
 ---
 
-## Steam Decky Loader Plugin
+## Usage
 
-The `decky/` directory contains the Steam Quick Access Menu interface.
+### 1. Start the daemon
 
-### Features
-* **NPU Upscaling Toggle**: Enable or disable Hexscale in real-time while gaming.
-* **Texture Sharpness Slider**: Fine-tune contrast and edge sharpness (0% to 100%).
-* **Clock Profiles**:
-  * `Efficiency`: Minimal power draw.
-  * `Balanced`: Dynamic frequency scaling.
-  * `Burst`: Maximum HTP frequency for competitive latency.
-* **Live Telemetry**: Displays real-time inference latency (ms), active model, and SoC status directly in the Steam overlay.
+```bash
+# Direct execution
+./build/daemon/hexscaled
+
+# Or via systemd
+sudo systemctl enable --now hexscaled.service
+```
+
+### 2. Run a game with the Vulkan layer
+
+```bash
+export VK_LAYER_PATH="$(pwd)/build/layer:$VK_LAYER_PATH"
+export ENABLE_HEXSCALE=1
+./your_game_or_emulator
+```
+
+### 3. Run standalone benchmark
+
+```bash
+./build/cli/hexscale-cli --bench 200
+```
 
 ---
 
 ## License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+MIT
