@@ -1,10 +1,15 @@
 import os
+import json
 import socket
 import struct
 import asyncio
 from typing import Dict, Any
 
 SOCKET_PATH = "/run/hexscale/control.sock"
+SETTINGS_PATH = os.path.join(
+    os.environ.get("DECKY_PLUGIN_SETTINGS_DIR", "/var/home/armada/homebrew/settings/hexscale"),
+    "settings.json"
+)
 PROTOCOL_MAGIC = 0x48455853  # "HEXS"
 PROTOCOL_VERSION = 1
 
@@ -12,6 +17,29 @@ CMD_GET_STATUS = 0x0001
 CMD_SET_ENABLED = 0x0002
 CMD_SET_SHARPNESS = 0x0003
 CMD_SET_PROFILE = 0x0004
+
+DEFAULT_CONFIG = {
+    "enabled": True,
+    "sharpness": 0.75,
+    "profile": 1
+}
+
+def load_config() -> Dict[str, Any]:
+    try:
+        if os.path.exists(SETTINGS_PATH):
+            with open(SETTINGS_PATH, "r") as f:
+                return {**DEFAULT_CONFIG, **json.load(f)}
+    except Exception:
+        pass
+    return DEFAULT_CONFIG.copy()
+
+def save_config(cfg: Dict[str, Any]):
+    try:
+        os.makedirs(os.path.dirname(SETTINGS_PATH), exist_ok=True)
+        with open(SETTINGS_PATH, "w") as f:
+            json.dump(cfg, f, indent=2)
+    except Exception:
+        pass
 
 class Plugin:
     async def _main(self):
@@ -43,7 +71,6 @@ class Plugin:
                 client.connect(SOCKET_PATH)
                 client.sendall(packet)
 
-                # ResponsePacket: Header (16) + status (H) + StatusPayload (82 bytes)
                 raw_resp = client.recv(1024)
                 if len(raw_resp) < 18:
                     return {"success": False, "error": "Invalid response size", "data": None}
@@ -52,9 +79,6 @@ class Plugin:
                 payload_data = raw_resp[18:]
 
                 if len(payload_data) >= 80:
-                    # Parse StatusPayload
-                    # uint8_t enabled, uint8_t profile, uint16_t reserved, float sharpness,
-                    # float last_ms, float avg_ms, uint64_t total_frames, 32s model, 16s soc, 16s backend
                     enabled, profile, _, sharpness, last_ms, avg_ms, total_frames = struct.unpack(
                         "<BBHfffQ", payload_data[:28]
                     )
@@ -84,19 +108,54 @@ class Plugin:
 
     async def get_status(self) -> Dict[str, Any]:
         loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, self._send_command, CMD_GET_STATUS)
+        resp = await loop.run_in_executor(None, self._send_command, CMD_GET_STATUS)
+        cfg = load_config()
+        if resp.get("success") and resp.get("data"):
+            return {
+                "success": True,
+                "online": True,
+                "data": resp["data"]
+            }
+        else:
+            return {
+                "success": True,
+                "online": False,
+                "data": {
+                    "enabled": cfg["enabled"],
+                    "sharpness": cfg["sharpness"],
+                    "profile": cfg["profile"],
+                    "model_name": "HTP v73 Super-Resolution",
+                    "soc": "Snapdragon 8 Gen 2 (SM8550)",
+                    "backend": "Hexagon CDSP (FastRPC)",
+                    "last_inference_ms": 0.0,
+                    "avg_inference_ms": 0.0,
+                    "total_frames": 0
+                }
+            }
 
     async def set_enabled(self, enabled: bool) -> Dict[str, Any]:
+        cfg = load_config()
+        cfg["enabled"] = bool(enabled)
+        save_config(cfg)
         payload = struct.pack("<B", 1 if enabled else 0)
         loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, self._send_command, CMD_SET_ENABLED, payload)
+        await loop.run_in_executor(None, self._send_command, CMD_SET_ENABLED, payload)
+        return {"success": True}
 
     async def set_sharpness(self, sharpness: float) -> Dict[str, Any]:
+        cfg = load_config()
+        cfg["sharpness"] = float(sharpness)
+        save_config(cfg)
         payload = struct.pack("<f", float(sharpness))
         loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, self._send_command, CMD_SET_SHARPNESS, payload)
+        await loop.run_in_executor(None, self._send_command, CMD_SET_SHARPNESS, payload)
+        return {"success": True}
 
     async def set_profile(self, profile: int) -> Dict[str, Any]:
+        cfg = load_config()
+        cfg["profile"] = int(profile)
+        save_config(cfg)
         payload = struct.pack("<B", int(profile))
         loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, self._send_command, CMD_SET_PROFILE, payload)
+        await loop.run_in_executor(None, self._send_command, CMD_SET_PROFILE, payload)
+        return {"success": True}

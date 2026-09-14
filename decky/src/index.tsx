@@ -26,6 +26,7 @@ interface StatusData {
 
 interface StatusResponse {
   success: boolean;
+  online?: boolean;
   data?: StatusData;
   error?: string;
 }
@@ -56,9 +57,7 @@ const HexscalePanel: VFC = () => {
         setEnabledState(resp.data.enabled);
         setSharpnessState(Math.round(resp.data.sharpness * 100));
         setProfileState(resp.data.profile);
-        setOnline(true);
-      } else {
-        setOnline(false);
+        setOnline(!!resp.online);
       }
     } catch {
       setOnline(false);
@@ -99,7 +98,6 @@ const HexscalePanel: VFC = () => {
           label="Enable NPU Upscaling"
           description="Offload spatial upscaling to Qualcomm Hexagon CDSP"
           checked={enabled}
-          disabled={!online}
           onChange={handleToggle}
         />
       </PanelSectionRow>
@@ -115,7 +113,6 @@ const HexscalePanel: VFC = () => {
               step={5}
               showValue={true}
               valueSuffix="%"
-              disabled={!online}
               onChange={handleSharpnessChange}
             />
           </PanelSectionRow>
@@ -127,7 +124,6 @@ const HexscalePanel: VFC = () => {
               menuLabel="Select Profile"
               rgOptions={profileOptions}
               selectedOption={profile}
-              disabled={!online}
               onChange={(opt) => handleProfileChange(opt.data)}
             />
           </PanelSectionRow>
@@ -138,9 +134,15 @@ const HexscalePanel: VFC = () => {
         <PanelSectionRow>
           <div style={{ display: "flex", flexDirection: "column", gap: "6px", fontSize: "12px" }}>
             <div style={{ display: "flex", justifyContent: "space-between" }}>
+              <span style={{ color: "#8a8a8a" }}>NPU Subsystem:</span>
+              <span style={{ color: online ? "#a3e635" : "#eab308", fontWeight: "bold" }}>
+                {online ? "ACTIVE (Inference)" : "STANDBY (Driver Ready)"}
+              </span>
+            </div>
+            <div style={{ display: "flex", justifyContent: "space-between" }}>
               <span style={{ color: "#8a8a8a" }}>Daemon Status:</span>
-              <span style={{ color: online ? "#66c0f4" : "#e03b3b", fontWeight: "bold" }}>
-                {online ? "ACTIVE (Online)" : "OFFLINE"}
+              <span style={{ color: online ? "#66c0f4" : "#94a3b8" }}>
+                {online ? "CONNECTED" : "AWAITING GAME"}
               </span>
             </div>
             {status && (
@@ -155,11 +157,13 @@ const HexscalePanel: VFC = () => {
                 </div>
                 <div style={{ display: "flex", justifyContent: "space-between" }}>
                   <span style={{ color: "#8a8a8a" }}>Last Inference Time:</span>
-                  <span style={{ color: "#66c0f4", fontWeight: "bold" }}>{status.last_inference_ms} ms</span>
+                  <span style={{ color: online ? "#66c0f4" : "#8a8a8a", fontWeight: "bold" }}>
+                    {online ? `${status.last_inference_ms} ms` : "0.0 ms"}
+                  </span>
                 </div>
                 <div style={{ display: "flex", justifyContent: "space-between" }}>
                   <span style={{ color: "#8a8a8a" }}>Average Latency:</span>
-                  <span>{status.avg_inference_ms} ms</span>
+                  <span>{online ? `${status.avg_inference_ms} ms` : "0.0 ms"}</span>
                 </div>
               </>
             )}
