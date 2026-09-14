@@ -1,15 +1,16 @@
 import {
   definePlugin,
+  callable
+} from "@decky/api";
+import {
   PanelSection,
   PanelSectionRow,
   ToggleField,
   SliderField,
   DropdownItem,
-  ServerAPI,
   staticClasses
-} from "decky-frontend-lib";
-import { VFC, useState, useEffect } from "react";
-import { FaMicrochip } from "react-icons/fa";
+} from "@decky/ui";
+import React, { VFC, useState, useEffect } from "react";
 
 interface StatusData {
   enabled: boolean;
@@ -23,21 +24,38 @@ interface StatusData {
   backend: string;
 }
 
-const HexscalePanel: VFC<{ serverApi: ServerAPI }> = ({ serverApi }) => {
-  const [enabled, setEnabled] = useState<boolean>(true);
-  const [sharpness, setSharpness] = useState<number>(75);
-  const [profile, setProfile] = useState<number>(1);
+interface StatusResponse {
+  success: boolean;
+  data?: StatusData;
+  error?: string;
+}
+
+const getStatus = callable<[], StatusResponse>("get_status");
+const setEnabled = callable<[boolean], { success: boolean }>("set_enabled");
+const setSharpness = callable<[number], { success: boolean }>("set_sharpness");
+const setProfile = callable<[number], { success: boolean }>("set_profile");
+
+const HexscaleIcon: VFC = () => (
+  <svg viewBox="0 0 24 24" width="1em" height="1em" fill="currentColor">
+    <path d="M4 4h4v4H4V4zm6 0h4v4h-4V4zm6 0h4v4h-4V4zM4 10h4v4H4v-4zm6 0h4v4h-4v-4zm6 0h4v4h-4v-4zM4 16h4v4H4v-4zm6 0h4v4h-4v-4zm6 0h4v4h-4v-4z"/>
+  </svg>
+);
+
+const HexscalePanel: VFC = () => {
+  const [enabled, setEnabledState] = useState<boolean>(true);
+  const [sharpness, setSharpnessState] = useState<number>(75);
+  const [profile, setProfileState] = useState<number>(1);
   const [status, setStatus] = useState<StatusData | null>(null);
   const [online, setOnline] = useState<boolean>(false);
 
   const fetchStatus = async () => {
     try {
-      const resp = await serverApi.callPluginMethod<Record<string, unknown>, { success: boolean; data?: StatusData }>("get_status", {});
-      if (resp.success && resp.result?.success && resp.result.data) {
-        setStatus(resp.result.data);
-        setEnabled(resp.result.data.enabled);
-        setSharpness(Math.round(resp.result.data.sharpness * 100));
-        setProfile(resp.result.data.profile);
+      const resp = await getStatus();
+      if (resp && resp.success && resp.data) {
+        setStatus(resp.data);
+        setEnabledState(resp.data.enabled);
+        setSharpnessState(Math.round(resp.data.sharpness * 100));
+        setProfileState(resp.data.profile);
         setOnline(true);
       } else {
         setOnline(false);
@@ -54,18 +72,18 @@ const HexscalePanel: VFC<{ serverApi: ServerAPI }> = ({ serverApi }) => {
   }, []);
 
   const handleToggle = async (newVal: boolean) => {
-    setEnabled(newVal);
-    await serverApi.callPluginMethod("set_enabled", { enabled: newVal });
+    setEnabledState(newVal);
+    await setEnabled(newVal);
   };
 
   const handleSharpnessChange = async (newVal: number) => {
-    setSharpness(newVal);
-    await serverApi.callPluginMethod("set_sharpness", { sharpness: newVal / 100.0 });
+    setSharpnessState(newVal);
+    await setSharpness(newVal / 100.0);
   };
 
   const handleProfileChange = async (newProfile: number) => {
-    setProfile(newProfile);
-    await serverApi.callPluginMethod("set_profile", { profile: newProfile });
+    setProfileState(newProfile);
+    await setProfile(newProfile);
   };
 
   const profileOptions = [
@@ -152,11 +170,13 @@ const HexscalePanel: VFC<{ serverApi: ServerAPI }> = ({ serverApi }) => {
   );
 };
 
-export default definePlugin((serverApi: ServerAPI) => {
+export default definePlugin(() => {
   return {
-    title: <div className={staticClasses.Title}>Hexscale</div>,
-    content: <HexscalePanel serverApi={serverApi} />,
-    icon: <FaMicrochip />,
+    name: "Hexscale",
+    titleView: <div className={staticClasses.Title}>Hexscale</div>,
+    content: <HexscalePanel />,
+    icon: <HexscaleIcon />,
+    alwaysRender: true,
     onDismount() {}
   };
 });
