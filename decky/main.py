@@ -78,13 +78,13 @@ class Plugin:
                 _, _, _, _, _, status_code = struct.unpack("<IIHHIH", raw_resp[:18])
                 payload_data = raw_resp[18:]
 
-                if len(payload_data) >= 80:
+                if len(payload_data) >= 88:
                     enabled, profile, _, sharpness, last_ms, avg_ms, total_frames = struct.unpack(
-                        "<BBHfffQ", payload_data[:28]
+                        "<BBHfffQ", payload_data[:24]
                     )
-                    model_name = payload_data[28:60].decode('utf-8', errors='ignore').split('\x00')[0]
-                    soc = payload_data[60:76].decode('utf-8', errors='ignore').split('\x00')[0]
-                    backend = payload_data[76:92].decode('utf-8', errors='ignore').split('\x00')[0]
+                    model_name = payload_data[24:56].decode('utf-8', errors='ignore').split('\x00')[0]
+                    soc = payload_data[56:72].decode('utf-8', errors='ignore').split('\x00')[0]
+                    backend = payload_data[72:88].decode('utf-8', errors='ignore').split('\x00')[0]
 
                     return {
                         "success": True,
