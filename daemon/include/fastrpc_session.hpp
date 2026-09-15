@@ -12,12 +12,22 @@ namespace hexscale::fastrpc {
 constexpr const char* FASTRPC_CDSP_DEV = "/dev/fastrpc-cdsp";
 constexpr const char* FASTRPC_CDSP_SECURE_DEV = "/dev/fastrpc-cdsp-secure";
 
-// FastRPC IOCTL Definitions (matching Linux kernel drivers/misc/fastrpc.c)
-#define FASTRPC_IOCTL_INVOKE         _IOWR('R', 1, struct fastrpc_ioctl_invoke)
-#define FASTRPC_IOCTL_MMAP           _IOWR('R', 2, struct fastrpc_ioctl_mmap)
-#define FASTRPC_IOCTL_MUNMAP         _IOWR('R', 3, struct fastrpc_ioctl_munmap)
-#define FASTRPC_IOCTL_INIT           _IOWR('R', 4, struct fastrpc_ioctl_init)
-#define FASTRPC_IOCTL_GET_DSP_INFO   _IOWR('R', 13, struct fastrpc_ioctl_dsp_capabilities)
+#include <linux/types.h>
+#if __has_include(<misc/fastrpc.h>)
+#include <misc/fastrpc.h>
+#elif __has_include(<linux/misc/fastrpc.h>)
+#include <linux/misc/fastrpc.h>
+#else
+#define FASTRPC_IOCTL_ALLOC_DMA_BUFF	_IOWR('R', 1, struct fastrpc_alloc_dma_buf)
+#define FASTRPC_IOCTL_FREE_DMA_BUFF	_IOWR('R', 2, __u32)
+#define FASTRPC_IOCTL_INVOKE		_IOWR('R', 3, struct fastrpc_invoke)
+#define FASTRPC_IOCTL_INIT_ATTACH	_IO('R', 4)
+#define FASTRPC_IOCTL_INIT_CREATE	_IOWR('R', 5, struct fastrpc_init_create)
+#define FASTRPC_IOCTL_MMAP		_IOWR('R', 6, struct fastrpc_req_mmap)
+#define FASTRPC_IOCTL_MUNMAP		_IOWR('R', 7, struct fastrpc_req_munmap)
+#define FASTRPC_IOCTL_MEM_MAP		_IOWR('R', 10, struct fastrpc_mem_map)
+#define FASTRPC_IOCTL_MEM_UNMAP		_IOWR('R', 11, struct fastrpc_mem_unmap)
+#endif
 
 enum FastRpcDomain {
     CDSP_DOMAIN = 3 // Compute DSP domain (NPU)

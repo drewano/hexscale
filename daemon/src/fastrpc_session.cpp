@@ -10,35 +10,7 @@
 
 namespace hexscale::fastrpc {
 
-// Kernel FastRPC structures matching drivers/misc/fastrpc.c
-struct fastrpc_ioctl_invoke {
-    uint32_t handle;
-    uint32_t sc;
-    uint64_t pra;
-};
-
-struct fastrpc_ioctl_mmap {
-    int fd;
-    uint32_t flags;
-    uintptr_t vaddrin;
-    size_t size;
-    uintptr_t vaddrout;
-};
-
-struct fastrpc_ioctl_munmap {
-    uintptr_t vaddrout;
-    size_t size;
-};
-
-struct fastrpc_ioctl_init {
-    uint32_t flags;
-    uint64_t file;
-    uint32_t filelen;
-    int32_t filefd;
-    uint32_t siglen;
-    uint64_t sig;
-};
-
+// Using kernel structures from <misc/fastrpc.h>
 FastRpcSession::FastRpcSession() = default;
 
 FastRpcSession::~FastRpcSession() {
@@ -89,15 +61,10 @@ bool FastRpcSession::initialize(const std::string& dev_node) {
     }
 
     if (!m_using_qda) {
-        // Set initial session domain to CDSP
-        uint32_t init_flags = 0;
-        struct fastrpc_ioctl_init init_req{};
-        init_req.flags = init_flags;
-        init_req.filefd = -1;
-
-        if (::ioctl(m_fd, FASTRPC_IOCTL_INIT, &init_req) < 0) {
-            // Not all kernels require explicit INIT ioctl if opened on /dev/fastrpc-cdsp
-            std::cout << "[FastRPC] Direct CDSP device opened without INIT ioctl requirement." << std::endl;
+        if (::ioctl(m_fd, FASTRPC_IOCTL_INIT_ATTACH, 0) == 0) {
+            std::cout << "[FastRPC] Session attached to CDSP domain via FASTRPC_IOCTL_INIT_ATTACH." << std::endl;
+        } else {
+            std::cout << "[FastRPC] Direct CDSP device opened without INIT_ATTACH ioctl requirement." << std::endl;
         }
     }
 
@@ -146,10 +113,13 @@ void FastRpcSession::probe_hardware_capabilities() {
 void FastRpcSession::close() {
     if (m_fd >= 0) {
         for (const auto& mapping : m_active_mappings) {
-            struct fastrpc_ioctl_munmap unmap_req{};
+            struct fastrpc_req_munmap unmap_req{};
             unmap_req.vaddrout = mapping.vaddrout;
             unmap_req.size = mapping.size;
             ::ioctl(m_fd, FASTRPC_IOCTL_MUNMAP, &unmap_req);
+            if (mapping.fd >= 0) {
+                ::close(mapping.fd);
+            }
         }
         m_active_mappings.clear();
 
@@ -164,19 +134,31 @@ bool FastRpcSession::map_dmabuf(int dmabuf_fd, size_t size, uintptr_t& out_dsp_a
         return false;
     }
 
-    struct fastrpc_ioctl_mmap mmap_req{};
+    struct fastrpc_req_mmap mmap_req{};
     mmap_req.fd = dmabuf_fd;
     mmap_req.flags = m_dma_coherent ? 0x02 : 0x00; // Hint DMA coherency when verified in DT
     mmap_req.size = size;
     mmap_req.vaddrin = 0;
 
     if (::ioctl(m_fd, FASTRPC_IOCTL_MMAP, &mmap_req) < 0) {
-        std::cerr << "[FastRPC] FASTRPC_IOCTL_MMAP failed for fd=" << dmabuf_fd 
-                  << " (" << std::strerror(errno) << ")" << std::endl;
-        return false;
+        // Fallback to MEM_MAP ioctl if MMAP is deprecated in newer kernels
+        struct fastrpc_mem_map mem_map{};
+        mem_map.version = 0;
+        mem_map.fd = dmabuf_fd;
+        mem_map.offset = 0;
+        mem_map.flags = 0;
+        mem_map.vaddrin = 0;
+        mem_map.length = size;
+        if (::ioctl(m_fd, FASTRPC_IOCTL_MEM_MAP, &mem_map) < 0) {
+            std::cerr << "[FastRPC] FASTRPC_IOCTL_MMAP/MEM_MAP failed for fd=" << dmabuf_fd 
+                      << " (" << std::strerror(errno) << ")" << std::endl;
+            return false;
+        }
+        out_dsp_addr = mem_map.vaddrout;
+    } else {
+        out_dsp_addr = mmap_req.vaddrout;
     }
 
-    out_dsp_addr = mmap_req.vaddrout;
     m_active_mappings.push_back({
         .fd = dmabuf_fd,
         .flags = mmap_req.flags,
@@ -192,7 +174,7 @@ bool FastRpcSession::unmap_dmabuf(uintptr_t dsp_addr, size_t size) {
         return false;
     }
 
-    struct fastrpc_ioctl_munmap unmap_req{};
+    struct fastrpc_req_munmap unmap_req{};
     unmap_req.vaddrout = dsp_addr;
     unmap_req.size = size;
 
@@ -217,10 +199,10 @@ bool FastRpcSession::invoke(uint32_t handle, uint32_t sc, std::span<FastRpcRemot
         return false;
     }
 
-    struct fastrpc_ioctl_invoke invoke_req{};
+    struct fastrpc_invoke invoke_req{};
     invoke_req.handle = handle;
     invoke_req.sc = sc;
-    invoke_req.pra = reinterpret_cast<uint64_t>(args.data());
+    invoke_req.args = reinterpret_cast<uint64_t>(args.data());
 
     if (::ioctl(m_fd, FASTRPC_IOCTL_INVOKE, &invoke_req) < 0) {
         std::cerr << "[FastRPC] FASTRPC_IOCTL_INVOKE failed (" 

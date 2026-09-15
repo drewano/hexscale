@@ -101,12 +101,34 @@ void IpcServer::worker_loop() {
         }
 
         CommandPacket cmd{};
-        ssize_t bytes_read = ::recv(client_fd, &cmd, sizeof(cmd), 0);
+        struct msghdr msg{};
+        struct iovec iov[1];
+        iov[0].iov_base = &cmd;
+        iov[0].iov_len = sizeof(cmd);
+        msg.msg_iov = iov;
+        msg.msg_iovlen = 1;
+
+        union {
+            struct cmsghdr cm;
+            char control[CMSG_SPACE(sizeof(int))];
+        } control_un;
+        msg.msg_control = control_un.control;
+        msg.msg_controllen = sizeof(control_un.control);
+
+        ssize_t bytes_read = ::recvmsg(client_fd, &msg, 0);
+
+        int received_fd = -1;
+        struct cmsghdr* cmptr = CMSG_FIRSTHDR(&msg);
+        if (cmptr != nullptr && cmptr->cmsg_len == CMSG_LEN(sizeof(int))) {
+            if (cmptr->cmsg_level == SOL_SOCKET && cmptr->cmsg_type == SCM_RIGHTS) {
+                received_fd = *reinterpret_cast<int*>(CMSG_DATA(cmptr));
+            }
+        }
 
         if (bytes_read >= static_cast<ssize_t>(sizeof(Header)) && cmd.header.magic == PROTOCOL_MAGIC) {
             ResponsePacket resp{};
             if (m_handler) {
-                resp = m_handler(cmd);
+                resp = m_handler(cmd, received_fd);
             } else {
                 resp.header.magic = PROTOCOL_MAGIC;
                 resp.header.version = PROTOCOL_VERSION;
@@ -116,6 +138,10 @@ void IpcServer::worker_loop() {
             ::send(client_fd, &resp, sizeof(resp), 0);
         } else {
             std::cerr << "[IPC] Invalid command packet received from client." << std::endl;
+        }
+
+        if (received_fd >= 0 && cmd.header.msg_type != static_cast<uint16_t>(CommandType::REGISTER_DMABUF)) {
+            ::close(received_fd);
         }
 
         ::close(client_fd);

@@ -10,7 +10,7 @@ namespace hexscale::ipc {
 
 class IpcServer {
 public:
-    using CommandHandler = std::function<ResponsePacket(const CommandPacket&)>;
+    using CommandHandler = std::function<ResponsePacket(const CommandPacket&, int passed_fd)>;
 
     IpcServer();
     ~IpcServer();

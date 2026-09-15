@@ -15,6 +15,7 @@ enum class CommandType : uint16_t {
     SET_SHARPNESS    = 0x0003,
     SET_PROFILE      = 0x0004,
     REPORT_FRAMES    = 0x0005,
+    REGISTER_DMABUF  = 0x0006,
     SHUTDOWN_DAEMON  = 0x00FF
 };
 
@@ -61,6 +62,14 @@ struct CommandPacket {
             uint32_t frame_count;
             float inference_ms;
         } report_frames;
+
+        struct {
+            uint32_t width;
+            uint32_t height;
+            uint32_t stride;
+            uint32_t format;
+            uint64_t size;
+        } register_dmabuf;
     } payload;
 };
 
