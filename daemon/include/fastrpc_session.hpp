@@ -63,6 +63,10 @@ public:
     void close();
 
     [[nodiscard]] bool is_connected() const { return m_fd >= 0; }
+    // Number of live CDSP mappings (for eviction policy)
+    [[nodiscard]] size_t mapping_count() const { return m_active_mappings.size(); }
+    // Unmap + release the oldest mapping (bounded resource usage)
+    bool unmap_oldest();
     [[nodiscard]] int get_fd() const { return m_fd; }
 
     // Map a dma-buf descriptor into the CDSP SMMU address space

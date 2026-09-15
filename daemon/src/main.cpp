@@ -2,6 +2,7 @@
 #include <csignal>
 #include <atomic>
 #include <thread>
+#include <algorithm>
 #include <chrono>
 #include <cstring>
 #include <fcntl.h>
@@ -23,8 +24,8 @@ namespace {
 
 int main(int argc, char* argv[]) {
     std::cout << "=================================================" << std::endl;
-    std::cout << "   Hexscale Daemon (hexscaled) v0.1.0            " << std::endl;
-    std::cout << "   Qualcomm Hexagon NPU Super-Resolution Service " << std::endl;
+    std::cout << "   Hexscale Daemon (hexscaled) v0.2.0            " << std::endl;
+    std::cout << "   Sharpening control + NPU telemetry service    " << std::endl;
     std::cout << "=================================================" << std::endl;
 
     std::signal(SIGINT, signal_handler);
@@ -57,7 +58,9 @@ int main(int argc, char* argv[]) {
     std::atomic<float> current_sharpness{0.75f};
     std::atomic<uint8_t> current_profile{static_cast<uint8_t>(hexscale::ipc::NpuProfile::BALANCED)};
     std::atomic<uint64_t> total_frames{0};
-    std::atomic<float> last_latency_ms{0.82f};
+    std::atomic<float> last_latency_ms{0.0f};
+    std::atomic<float> avg_latency_ms{0.0f};
+    uint64_t timed_samples = 0;
 
     // 4. Start IPC Server
     hexscale::ipc::IpcServer ipc;
@@ -74,11 +77,15 @@ int main(int argc, char* argv[]) {
                 resp.status_data.profile = current_profile.load();
                 resp.status_data.sharpness = current_sharpness.load();
                 resp.status_data.last_inference_ms = last_latency_ms.load();
-                resp.status_data.avg_inference_ms = 0.85f;
+                resp.status_data.avg_inference_ms = avg_latency_ms.load();
                 resp.status_data.total_frames_upscaled = total_frames.load();
-                std::strncpy(resp.status_data.model_name, qnn.get_model_name().c_str(), sizeof(resp.status_data.model_name) - 1);
-                std::strncpy(resp.status_data.target_soc, "SM8550", sizeof(resp.status_data.target_soc) - 1);
-                std::strncpy(resp.status_data.backend_version, "HTP-v73", sizeof(resp.status_data.backend_version) - 1);
+                std::strncpy(resp.status_data.model_name, qnn.get_model_name().c_str(),
+                             sizeof(resp.status_data.model_name) - 1);
+                std::strncpy(resp.status_data.target_soc, "SM8550",
+                             sizeof(resp.status_data.target_soc) - 1);
+                std::strncpy(resp.status_data.backend_version,
+                             qnn.is_htp_available() ? "HTP-v73" : "GPU-CAS",
+                             sizeof(resp.status_data.backend_version) - 1);
                 break;
             }
             case hexscale::ipc::CommandType::SET_ENABLED: {
@@ -103,10 +110,14 @@ int main(int argc, char* argv[]) {
             }
             case hexscale::ipc::CommandType::REPORT_FRAMES: {
                 uint32_t count = cmd.payload.report_frames.frame_count;
-                if (count == 0) count = 1;
                 total_frames.fetch_add(count);
-                if (cmd.payload.report_frames.inference_ms > 0.0f) {
-                    last_latency_ms.store(cmd.payload.report_frames.inference_ms);
+                float ms = cmd.payload.report_frames.inference_ms;
+                if (ms > 0.0f) {
+                    last_latency_ms.store(ms);
+                    // Incremental running average, no history buffer needed.
+                    timed_samples++;
+                    float prev = avg_latency_ms.load();
+                    avg_latency_ms.store(prev + (ms - prev) / static_cast<float>(timed_samples));
                 }
                 int fd = ::open("/run/hexscale/active", O_WRONLY | O_CREAT | O_TRUNC, 0666);
                 if (fd >= 0) {
@@ -126,6 +137,10 @@ int main(int argc, char* argv[]) {
                 if (passed_fd >= 0) {
                     std::cout << "[hexscaled] Received DMA-BUF file descriptor fd=" << passed_fd 
                               << " via SCM_RIGHTS" << std::endl;
+                    // Bound CDSP mappings: evict the oldest when full.
+                    while (fastrpc.mapping_count() >= 8) {
+                        fastrpc.unmap_oldest();
+                    }
                     uintptr_t dsp_addr = 0;
                     bool mapped = fastrpc.map_dmabuf(passed_fd, size, dsp_addr);
                     if (mapped) {
@@ -133,7 +148,10 @@ int main(int argc, char* argv[]) {
                                   << std::hex << dsp_addr << std::dec << " (Size: " << size << " bytes)" << std::endl;
                         resp.status = hexscale::ipc::StatusCode::OK;
                     } else {
-                        std::cerr << "[hexscaled] Notice: FastRPC SMMU Mapping fallback mode." << std::endl;
+                        // Map failed: the fd is still ours to release.
+                        ::close(passed_fd);
+                        std::cerr << "[hexscaled] CDSP map failed for this buffer; "
+                                     "GPU path unaffected." << std::endl;
                         resp.status = hexscale::ipc::StatusCode::OK;
                     }
                 } else {

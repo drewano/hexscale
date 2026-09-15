@@ -169,6 +169,18 @@ bool FastRpcSession::map_dmabuf(int dmabuf_fd, size_t size, uintptr_t& out_dsp_a
     return true;
 }
 
+bool FastRpcSession::unmap_oldest() {
+    if (m_active_mappings.empty()) return false;
+    const FastRpcMemoryMapping& m = m_active_mappings.front();
+    struct fastrpc_req_munmap unmap_req{};
+    unmap_req.vaddrout = m.vaddrout;
+    unmap_req.size = m.size;
+    ::ioctl(m_fd, FASTRPC_IOCTL_MUNMAP, &unmap_req);
+    if (m.fd >= 0) ::close(m.fd);
+    m_active_mappings.erase(m_active_mappings.begin());
+    return true;
+}
+
 bool FastRpcSession::unmap_dmabuf(uintptr_t dsp_addr, size_t size) {
     if (m_fd < 0 || dsp_addr == 0) {
         return false;

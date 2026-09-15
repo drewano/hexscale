@@ -4,6 +4,7 @@
 #include <iostream>
 #include <fstream>
 #include <cstring>
+#include <algorithm>
 #include <chrono>
 
 namespace hexscale::qnn {
@@ -61,10 +62,9 @@ void QnnHtpBackend::shutdown() {
 bool QnnHtpBackend::load_context_binary(const std::string& model_bin_path) {
     std::ifstream file(model_bin_path, std::ios::binary | std::ios::ate);
     if (!file.is_open()) {
-        std::cerr << "[QNN-HTP] Context binary not found at " << model_bin_path 
-                  << ". Using default embedded XLSR-x1.5 parameters." << std::endl;
-        m_model_name = "XLSR-x1.5-INT8 (Builtin)";
-        return true;
+        std::cerr << "[QNN-HTP] No context binary at " << model_bin_path
+                  << ". HTP inference unavailable (GPU CAS remains active)." << std::endl;
+        return false;
     }
 
     std::streamsize size = file.tellg();
@@ -78,7 +78,7 @@ bool QnnHtpBackend::load_context_binary(const std::string& model_bin_path) {
 
     std::cout << "[QNN-HTP] Loaded context binary " << model_bin_path 
               << " (" << size << " bytes) into Hexagon TCM / L2 cache." << std::endl;
-    m_model_name = "XLSR-x1.5-INT8";
+    m_model_name = "HTP-context";
     return true;
 }
 
@@ -109,7 +109,7 @@ InferenceMetrics QnnHtpBackend::execute_host_memory(const uint8_t* input_data, s
         return metrics;
     }
 
-    // High performance bilinear interpolation with edge sharpening filter (XLSR reference operator)
+    // CPU bilinear reference used only by hexscale-cli benchmarks (not the layer)
     const uint32_t in_w = m_input_info.width;
     const uint32_t in_h = m_input_info.height;
     const uint32_t out_w = m_output_info.width;

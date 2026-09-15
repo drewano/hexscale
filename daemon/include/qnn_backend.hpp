@@ -53,11 +53,13 @@ public:
                                          uint8_t* output_data, size_t output_size);
 
     [[nodiscard]] bool is_ready() const { return m_is_ready; }
+    // True only when the proprietary QNN HTP runtime was actually loaded.
+    [[nodiscard]] bool is_htp_available() const { return m_qnn_lib_handle != nullptr; }
     [[nodiscard]] const std::string& get_model_name() const { return m_model_name; }
 
 private:
     bool m_is_ready{false};
-    std::string m_model_name{"XLSR-x1.5-INT8"};
+    std::string m_model_name{"GPU-CAS"};
     void* m_qnn_lib_handle{nullptr};
     void* m_qnn_context_handle{nullptr};
     void* m_qnn_graph_handle{nullptr};
