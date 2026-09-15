@@ -197,6 +197,9 @@ VKAPI_ATTR VkResult VKAPI_CALL hexscale_vkCreateDevice(
         auto present_fn = (PFN_vkQueuePresentKHR)next_gdpa(*pDevice, "vkQueuePresentKHR");
         if (present_fn) {
             g_device_present[dev_key] = present_fn;
+            std::cout << "[Hexscale-Layer] Found vkQueuePresentKHR for device key " << dev_key << std::endl;
+        } else {
+            std::cout << "[Hexscale-Layer] WARNING: next_gdpa returned nullptr for vkQueuePresentKHR!" << std::endl;
         }
         std::cout << "[Hexscale-Layer] Intercepted device " << *pDevice << " for NPU upscaling pipeline." << std::endl;
     }
@@ -207,22 +210,19 @@ VKAPI_ATTR void VKAPI_CALL hexscale_vkDestroyDevice(
     VkDevice device,
     const VkAllocationCallbacks* pAllocator)
 {
-    void* key = get_dispatch_key(device);
-    PFN_vkGetDeviceProcAddr next_gdpa = nullptr;
+    void* dev_key = get_dispatch_key(device);
+    PFN_vkDestroyDevice next_destroy = nullptr;
     {
         std::lock_guard<std::mutex> lock(g_lock);
-        auto it = g_device_dispatch.find(key);
-        if (it != g_device_dispatch.end()) {
-            next_gdpa = it->second;
-            g_device_dispatch.erase(it);
-            g_device_present.erase(key);
+        auto it = g_device_dispatch.find(dev_key);
+        if (it != g_device_dispatch.end() && it->second) {
+            next_destroy = (PFN_vkDestroyDevice)it->second(device, "vkDestroyDevice");
         }
+        g_device_dispatch.erase(dev_key);
+        g_device_present.erase(dev_key);
     }
-    if (next_gdpa) {
-        PFN_vkDestroyDevice next_destroy = (PFN_vkDestroyDevice)next_gdpa(device, "vkDestroyDevice");
-        if (next_destroy) {
-            next_destroy(device, pAllocator);
-        }
+    if (next_destroy) {
+        next_destroy(device, pAllocator);
     }
 }
 
@@ -311,6 +311,14 @@ VKAPI_ATTR VkResult VKAPI_CALL hexscale_vkQueuePresentKHR(
         auto it = g_queue_present.find(dispatch_key);
         if (it != g_queue_present.end()) {
             next_present = it->second;
+        } else {
+            auto dit = g_device_present.find(dispatch_key);
+            if (dit != g_device_present.end()) {
+                next_present = dit->second;
+            } else if (!g_device_present.empty()) {
+                // Single device fallback (standard handheld scenario)
+                next_present = g_device_present.begin()->second;
+            }
         }
     }
 
@@ -318,6 +326,7 @@ VKAPI_ATTR VkResult VKAPI_CALL hexscale_vkQueuePresentKHR(
         return next_present(queue, pPresentInfo);
     }
 
+    std::cout << "[Hexscale-Layer] ERROR: next_present is null for queue key " << dispatch_key << std::endl;
     return VK_SUCCESS;
 }
 
