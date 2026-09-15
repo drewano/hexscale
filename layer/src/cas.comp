@@ -1,0 +1,43 @@
+#version 450
+// Hexscale contrast-adaptive sharpening (CAS) compute pass.
+// Reads the presented frame, writes a sharpened copy into an equally sized
+// intermediate image. The caller copies the result back into the swapchain
+// image before presenting (storage writes cannot target the sampled input).
+// Inspired by the public AMD FidelityFX CAS algorithm (MIT), re-implemented
+// here in a compact 8-tap form.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0, rgba8) readonly uniform image2D inImage;
+layout(set = 0, binding = 1, rgba8) writeonly uniform image2D outImage;
+
+layout(push_constant) uniform Params {
+    float sharpness; // 0.0 = passthrough, 1.0 = maximum
+} params;
+
+void main() {
+    ivec2 xy = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(inImage);
+    if (xy.x >= size.x || xy.y >= size.y) {
+        return;
+    }
+
+    vec4 e  = imageLoad(inImage, xy);
+    vec4 n  = imageLoad(inImage, xy + ivec2( 0, -1));
+    vec4 s  = imageLoad(inImage, xy + ivec2( 0,  1));
+    vec4 w  = imageLoad(inImage, xy + ivec2(-1,  0));
+    vec4 ee = imageLoad(inImage, xy + ivec2( 1,  0));
+
+    // Local contrast envelope: clamp hard on busy neighborhoods so flat
+    // gradients stay smooth and edges get the boost.
+    vec4 mn = min(min(min(n, s), min(w, ee)), e);
+    vec4 mx = max(max(max(n, s), max(w, ee)), e);
+    vec4 amp = clamp(min(mn, 2.0 - mx) / max(mx, vec4(1e-4)), 0.0, 1.0);
+    amp = sqrt(amp);
+
+    vec4 blur = (n + s + w + ee) * 0.25;
+    float strength = params.sharpness * params.sharpness * 1.6;
+    vec4 result = e + (e - blur) * strength * amp;
+
+    imageStore(outImage, xy, clamp(result, 0.0, 1.0));
+}
