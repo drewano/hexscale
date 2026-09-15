@@ -21,11 +21,13 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y cmake build-essential libvulkan-dev glslang-tools
 
-      - name: Verify the CAS shader compiles
+      - name: Verify the CAS shaders compile
         run: |
-          glslangValidator -V --target-env vulkan1.1 -o /tmp/cas.spv layer/src/cas.comp
+          glslangValidator -V --target-env vulkan1.1 -o /tmp/cas.vert.spv layer/src/cas.vert
+          glslangValidator -V --target-env vulkan1.1 -o /tmp/cas.frag.spv layer/src/cas.frag
+          glslangValidator -V --target-env vulkan1.1 -DSWAP_RB -o /tmp/cas_bgra.spv layer/src/cas.frag
           # Byte-exact regeneration is not stable across glslang versions
-          # (generator version is embedded); we only check the shader builds.
+          # (generator version is embedded); we only check the shaders build.
 
       - name: Configure CMake
         run: cmake -B build -S . -DCMAKE_BUILD_TYPE=Release
