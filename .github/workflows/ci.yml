@@ -1,4 +1,4 @@
-name: Hexscale CI & Build
+name: CI & Build
 
 on:
   push:
@@ -8,9 +8,10 @@ on:
   workflow_dispatch:
 
 jobs:
-  build-and-test:
-    runs-on: ubuntu-latest
-
+  # Native aarch64 build — the binaries must run on Qualcomm handhelds
+  # (Odin 2 / SM8550), so the x86_ubuntu runner is useless here.
+  build-arm64:
+    runs-on: ubuntu-24.04-arm
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
@@ -18,30 +19,80 @@ jobs:
       - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake build-essential libvulkan-dev glslang-tools libwayland-dev
+          sudo apt-get install -y cmake build-essential libvulkan-dev glslang-tools
+
+      - name: Regenerate SPIR-V (consistency check)
+        run: |
+          cp layer/src/cas_spv.h /tmp/cas_spv.committed.h
+          ./scripts/build-shader.sh
+          diff /tmp/cas_spv.committed.h layer/src/cas_spv.h \
+            || (echo "::error::cas_spv.h is stale — run scripts/build-shader.sh"; exit 1)
 
       - name: Configure CMake
         run: cmake -B build -S . -DCMAKE_BUILD_TYPE=Release
 
-      - name: Build Binaries (Daemon, CLI, Vulkan Layer)
-        run: cmake --build build --parallel $(nproc)
+      - name: Build (daemon, CLI, Vulkan layer)
+        run: cmake --build build --parallel "$(nproc)"
 
-      - name: Run Standalone Latency Benchmark
-        run: ./build/cli/hexscale-cli --bench 50
-
-      - name: Package Decky Plugin
+      - name: Package release tarball
         run: |
-          mkdir -p build/dist/hexscale
-          cp -r decky/* build/dist/hexscale/
-          cd build/dist && zip -r hexscale-decky-plugin.zip hexscale
+          mkdir -p dist/hexscale/bin dist/hexscale/layer dist/hexscale/scripts
+          cp build/daemon/hexscaled dist/hexscale/bin/
+          cp build/cli/hexscale-cli dist/hexscale/bin/
+          cp build/layer/libVkLayer_hexscale.so dist/hexscale/layer/
+          cp layer/VkLayer_hexscale.json dist/hexscale/layer/
+          cp scripts/hexscaled.service scripts/hexscaled-user.service \
+             scripts/install.sh scripts/build-shader.sh dist/hexscale/scripts/
+          chmod +x dist/hexscale/scripts/*.sh
+          cd dist && tar czf hexscale-arm64.tar.gz hexscale
 
-      - name: Upload Artifacts
+      - name: Upload tarball artifact
         uses: actions/upload-artifact@v7
         with:
-          name: hexscale-binaries
-          path: |
-            build/daemon/hexscaled
-            build/cli/hexscale-cli
-            build/layer/libVkLayer_hexscale.so
-            build/layer/VkLayer_hexscale.json
-            build/dist/hexscale-decky-plugin.zip
+          name: hexscale-arm64
+          path: dist/hexscale-arm64.tar.gz
+
+  decky-plugin:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Build plugin frontend
+        run: |
+          cd decky
+          npm ci
+          npm run build
+
+      - name: Package plugin (no node_modules, no sources)
+        run: |
+          mkdir -p dist/hexscale
+          cp decky/main.py decky/plugin.json decky/package.json dist/hexscale/
+          cp -r decky/dist dist/hexscale/dist
+          cd dist && zip -rq hexscale-decky-plugin.zip hexscale
+
+      - name: Upload plugin artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: hexscale-decky-plugin
+          path: dist/hexscale-decky-plugin.zip
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build-arm64, decky-plugin]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v7
+        with:
+          merge-multiple: true
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            hexscale-arm64.tar.gz
+            hexscale-decky-plugin.zip

@@ -1,19 +1,17 @@
 [Unit]
-Description=Hexscale Qualcomm Hexagon NPU Super-Resolution Service
-After=network.target systemd-modules-load.service
-Wants=gamescope.service
+Description=Hexscale sharpening control daemon (hexscaled)
+After=multi-user.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/hexscaled --socket /run/hexscale/control.sock --model /usr/share/hexscale/models/xlsr_htp_v73.bin
-Restart=always
+ExecStart=/usr/bin/hexscaled --socket /run/hexscale/control.sock
+Restart=on-failure
 RestartSec=2s
 RuntimeDirectory=hexscale
-RuntimeDirectoryMode=0775
+RuntimeDirectoryMode=0777
+# Optional NPU access (dma-buf mapping); the daemon degrades gracefully
+# without it — GPU sharpening does not need these devices.
 DeviceAllow=/dev/fastrpc-cdsp rw
-DeviceAllow=/dev/fastrpc-cdsp-secure rw
-ProtectHome=read-only
-NoNewPrivileges=false
 
 [Install]
 WantedBy=multi-user.target

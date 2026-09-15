@@ -1,0 +1,13 @@
+[Unit]
+Description=Hexscale sharpening control daemon (hexscaled, user install)
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/hexscaled --socket %t/hexscale/control.sock
+Restart=on-failure
+RestartSec=2s
+ExecStartPre=/bin/sh -c 'mkdir -p %t/hexscale && chmod 0777 %t/hexscale'
+
+[Install]
+WantedBy=default.target
