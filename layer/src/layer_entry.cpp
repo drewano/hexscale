@@ -255,6 +255,7 @@ struct DeviceState {
     VkDescriptorSetLayout dsl = VK_NULL_HANDLE;
     VkPipelineLayout pl = VK_NULL_HANDLE;
     VkPipeline pipeline = VK_NULL_HANDLE;
+    bool pipeline_failed = false; // one failed attempt -> inert for this device
     VkQueryPool timing_pool = VK_NULL_HANDLE;
     uint32_t timing_seq = 0;
 
@@ -954,15 +955,13 @@ VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL hexscale_vkCreateDevice(
         }
     }
 
-    if (create_cas_pipeline(ds)) {
+    {
+        // Device tracked; the CAS pipeline is built lazily at the first
+        // swapchain creation — creating objects from inside this hook ran
+        // before upper layers finished their per-device setup.
         std::lock_guard<std::mutex> lock(g_lock);
         g_device_dispatch[get_dispatch_key(*pDevice)] = next_gdpa;
         g_devices[get_dispatch_key(*pDevice)] = ds;
-    } else {
-        // No pipeline = layer is inert for this device; dispatch stays intact.
-        destroy_device_state(ds);
-        std::lock_guard<std::mutex> lock(g_lock);
-        g_device_dispatch[get_dispatch_key(*pDevice)] = next_gdpa;
     }
     return res;
 }
@@ -1069,6 +1068,15 @@ VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL hexscale_vkCreateSwapchainKHR(
     if (!next_create) return VK_ERROR_INITIALIZATION_FAILED;
 
     if (!g_config.enabled || !ds || !format_ok) {
+        return next_create(device, pCreateInfo, pAllocator, pSwapchain);
+    }
+
+    if (ds->pipeline == VK_NULL_HANDLE && !ds->pipeline_failed) {
+        if (!create_cas_pipeline(ds)) {
+            ds->pipeline_failed = true; // inert for this device, fail-open
+        }
+    }
+    if (ds->pipeline == VK_NULL_HANDLE) {
         return next_create(device, pCreateInfo, pAllocator, pSwapchain);
     }
 
@@ -1262,6 +1270,11 @@ VK_LAYER_EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL hexscale_vkGetInstanceP
         return reinterpret_cast<PFN_vkVoidFunction>(hexscale_vkCreateInstance);
     if (strcmp(pName, "vkDestroyInstance") == 0)
         return reinterpret_cast<PFN_vkVoidFunction>(hexscale_vkDestroyInstance);
+    // vkCreateDevice is queryable with a NULL instance per spec; layers in
+    // the chain above us (e.g. gamescope WSI/vkroots) resolve their downchain
+    // exactly that way. Answering nullptr here made them call 0x0.
+    if (strcmp(pName, "vkCreateDevice") == 0)
+        return reinterpret_cast<PFN_vkVoidFunction>(hexscale_vkCreateDevice);
 
     if (instance != VK_NULL_HANDLE) {
         std::lock_guard<std::mutex> lock(g_lock);
