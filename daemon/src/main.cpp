@@ -9,6 +9,8 @@
 #include <thread>
 #include <chrono>
 #include <cstring>
+#include <fcntl.h>
+#include <unistd.h>
 
 namespace {
     std::atomic<bool> g_running{true};
@@ -99,6 +101,20 @@ int main(int argc, char* argv[]) {
                 resp.status = hexscale::ipc::StatusCode::OK;
                 break;
             }
+            case hexscale::ipc::CommandType::REPORT_FRAMES: {
+                uint32_t count = cmd.payload.report_frames.frame_count;
+                if (count == 0) count = 1;
+                total_frames.fetch_add(count);
+                if (cmd.payload.report_frames.inference_ms > 0.0f) {
+                    last_latency_ms.store(cmd.payload.report_frames.inference_ms);
+                }
+                int fd = ::open("/run/hexscale/active", O_WRONLY | O_CREAT | O_TRUNC, 0666);
+                if (fd >= 0) {
+                    ::close(fd);
+                }
+                resp.status = hexscale::ipc::StatusCode::OK;
+                break;
+            }
             case hexscale::ipc::CommandType::SHUTDOWN_DAEMON: {
                 std::cout << "[hexscaled] IPC requested daemon shutdown." << std::endl;
                 g_running = false;
@@ -119,10 +135,23 @@ int main(int argc, char* argv[]) {
 
     std::cout << "[hexscaled] Daemon initialized successfully. Ready to process frames." << std::endl;
 
+    auto last_active_check = std::chrono::steady_clock::now();
+    uint64_t prev_frames = 0;
+
     while (g_running) {
         std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        auto now = std::chrono::steady_clock::now();
+        if (std::chrono::duration_cast<std::chrono::seconds>(now - last_active_check).count() >= 3) {
+            last_active_check = now;
+            uint64_t curr_frames = total_frames.load();
+            if (curr_frames == prev_frames) {
+                ::unlink("/run/hexscale/active");
+            }
+            prev_frames = curr_frames;
+        }
     }
 
+    ::unlink("/run/hexscale/active");
     ipc.stop();
     fastrpc.close();
     std::cout << "[hexscaled] Clean shutdown complete." << std::endl;

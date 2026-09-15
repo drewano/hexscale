@@ -103,7 +103,7 @@ void IpcServer::worker_loop() {
         CommandPacket cmd{};
         ssize_t bytes_read = ::recv(client_fd, &cmd, sizeof(cmd), 0);
 
-        if (bytes_read == sizeof(cmd) && cmd.header.magic == PROTOCOL_MAGIC) {
+        if (bytes_read >= static_cast<ssize_t>(sizeof(Header)) && cmd.header.magic == PROTOCOL_MAGIC) {
             ResponsePacket resp{};
             if (m_handler) {
                 resp = m_handler(cmd);
