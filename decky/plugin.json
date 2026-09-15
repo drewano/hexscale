@@ -1,11 +1,19 @@
 {
   "name": "Hexscale",
   "author": "drewano",
-  "flags": ["root"],
+  "flags": [
+    "root"
+  ],
   "api_version": 1,
-  "version": "0.1.0",
-  "description": "Qualcomm Hexagon NPU Super-Resolution & Neural Upscaling for SteamOS",
+  "version": "0.2.0",
+  "description": "Contrast-adaptive sharpening (GPU CAS) for Qualcomm handhelds, with NPU telemetry",
   "publish": {
-    "tags": ["performance", "display", "npu", "qualcomm", "upscaling"]
+    "tags": [
+      "performance",
+      "display",
+      "npu",
+      "qualcomm",
+      "upscaling"
+    ]
   }
 }

@@ -1,105 +1,125 @@
 # hexscale
 
-Real-time neural upscaling on Qualcomm Hexagon NPUs (CDSP/HTP) for Linux handhelds.
+Contrast-adaptive sharpening (CAS) for Qualcomm handhelds running Linux
+(AYN Odin 2 / SM8550 and friends), applied as a Vulkan layer at presentation
+time — no custom OS image required.
 
-`hexscale` offloads super-resolution inference from the GPU to the Qualcomm Hexagon Tensor Processor (HTP) on Snapdragon SoCs (SM8550 / AYN Odin 2, SM8650, SM8750). Frames are routed between Vulkan and the CDSP via zero-copy `dma-buf` sharing, eliminating GPU shader overhead for spatial upscaling.
+`hexscale` intercepts `vkQueuePresentKHR`, runs a compute-shader CAS pass over
+the presented frame, and copies the sharpened result back into the swapchain
+image before the compositor (Gamescope) receives it. It combines naturally
+with compositor-side upscaling (FSR/linear): the game renders at 720p, hexscale
+sharpens the fine details, Gamescope scales to the 1080p panel.
+
+---
+
+## What works and what doesn't (honest state)
+
+**Working today (validated on an Odin 2):**
+- Vulkan implicit layer with a real, visible CAS sharpening pass (GPU/Adreno).
+- Fail-open design: any error, unsupported format or dead daemon silently
+  falls back to passthrough — the layer cannot black-screen or freeze a game.
+- Zero blocking in the present path (telemetry on a background thread).
+- Real GPU timing via timestamp queries, surfaced in the daemon status.
+- `hexscaled` control daemon (enable/sharpness/profile over IPC), Decky plugin
+  for the Quick Access Menu.
+- FastRPC/CDSP foundation: `SCM_RIGHTS` dma-buf registration and
+  `FASTRPC_IOCTL_MMAP` into the CDSP SMMU (proven on hardware, ready for a
+  future NPU consumer).
+
+**Not working (and why):**
+- **Neural inference on the Hexagon HTP.** The QNN path requires Qualcomm's
+  proprietary QNN SDK (`libQnnHtp.so` + a context binary compiled offline).
+  The SDK is license-restricted and cannot ship in this repo or CI. The
+  daemon keeps the loader and dma-buf plumbing; without the SDK it reports
+  `GPU-CAS` and everything still works. `models/convert_qnn.py` documents the
+  offline pipeline you would run with the SDK installed.
 
 ---
 
 ## Architecture
 
 ```
-Game / Emulator (Vulkan)
+Game / Emulator (Vulkan, e.g. DXVK)
        │
        │ vkQueuePresentKHR
        ▼
-VK_LAYER_HEXSCALE (Vulkan Layer)
-       │
-       │ dma-buf export + Unix socket IPC
-       ▼
-hexscaled (C++20 daemon)
-       │
-       │ FastRPC (/dev/fastrpc-cdsp) or DRM QDA (/dev/accel/accel0)
-       ▼
-Qualcomm Hexagon HTP (INT8 Tensor Execution)
-       │
-       │ Upscaled buffer
-       ▼
-Gamescope / Wayland Compositor (scanout)
+VK_LAYER_HEXSCALE (implicit layer)
+  ├─ CAS compute pass (contrast-adaptive sharpening, Adreno GPU)
+  ├─ copy back into the swapchain image → presented image is sharpened
+  └─ async telemetry (frames, GPU ms) ──► hexscaled (unix socket)
+                                            │
+                                            ├─ enable / sharpness / profile
+                                            ├─ optional: dma-buf → CDSP SMMU
+                                            │   (foundation for NPU inference)
+                                            └─ status → Decky plugin (QAM)
+Gamescope / compositor receives the sharpened frame and upscales it
 ```
 
 ### Components
-
-* **`daemon/` (`hexscaled`)**: C++20 daemon that maintains the FastRPC / QDA session, keeps the QNN model context resident in Hexagon TCM/L2 memory, maps `dma-buf` file descriptors into CDSP SMMU space, and handles IPC over `/run/hexscale/control.sock`.
-* **`layer/` (`VK_LAYER_HEXSCALE`)**: Vulkan explicit layer that intercepts `vkQueuePresentKHR`, exports swapchain images as `dma-buf` handles, and synchronizes presentation with `hexscaled`.
-* **`cli/` (`hexscale-cli`)**: Benchmark and debugging utility for testing inference latency, memory mapping overhead, and IPC round-trips without launching a game.
-* **`decky/`**: Decky Loader plugin providing toggles, sharpness adjustments, and power profiles directly in the SteamOS Quick Access Menu (QAM).
-* **`models/`**: Conversion tooling (`convert_qnn.py`) to compile ONNX super-resolution models into QNN context binaries for HTP targets.
-
----
-
-## Quantization & HTP Throughput
-
-The Hexagon Tensor Processor (HTP v73 on SM8550) achieves its rated throughput strictly with symmetric **INT8** quantization (`W8A8`).
-
-* **Unquantized models (FP32 / FP16)**: Fall back to scalar DSP emulation, leading to high latency and frame drops.
-* **INT8 quantized models (e.g. XLSR, QuickSRNet)**: Run natively on HTP tensor units with sub-millisecond execution times (< 1 ms for 720p $\to$ 1080p) and minimal package power draw (< 1W).
+* **`layer/`** (`libVkLayer_hexscale.so`): Vulkan implicit layer doing the CAS
+  pass at present time, in-place on swapchain images.
+* **`daemon/`** (`hexscaled`): control daemon — IPC (`/run/hexscale/control.sock`),
+  FastRPC session, optional dma-buf mapping, live sharpness control.
+* **`cli/`** (`hexscale-cli`): CPU benchmark utility for the IPC/processing path.
+* **`decky/`**: Quick Access Menu plugin (toggle, sharpness slider, profile).
+* **`models/convert_qnn.py`**: documented (dry-run) pipeline to compile an ONNX
+  super-resolution model into an HTP context binary with the QNN SDK.
 
 ---
 
-## Kernel Requirements
+## Install (no custom image)
 
-1. **Qualcomm FastRPC**: `CONFIG_QCOM_FASTRPC=m` (or `=y`), with `/dev/fastrpc-cdsp` accessible, or the DRM QDA driver (`/dev/accel/accel0`).
-2. **CDSP Power Domain Scaling**: Kernel support for CDSP per-PD proxy performance states (Mukesh Ojha's upstream series, see [armada-packages#66](https://github.com/armada-os/armada-packages/pull/66)). Without this, the CDSP cannot scale up from its lowest idle frequency state.
-3. **DMA-BUF Sharing**: `CONFIG_DMA_SHARED_BUFFER=y` for zero-copy buffer handoff between Turnip (Vulkan) and the CDSP SMMU.
-
----
-
-## Building
-
-### Dependencies
-* C++20 compiler (`gcc` >= 13 or `clang` >= 16)
-* CMake >= 3.20
-* Vulkan headers and loader (`libvulkan-dev`)
-* DRM development headers (`libdrm-dev`)
-* (Optional) Qualcomm QNN SDK (for compiling context binaries from source)
-
-### Compilation
+Grab `hexscale-arm64.tar.gz` from [Releases](../../releases) (or CI artifacts),
+copy it to the device, then:
 
 ```bash
-git clone https://github.com/drewano/hexscale.git
-cd hexscale
+tar xzf hexscale-arm64.tar.gz && cd hexscale && ./scripts/install.sh
+```
+
+This installs into `~/.local` and starts a user-level daemon. Everything is
+gated behind `ENABLE_HEXSCALE=1`, so nothing changes until you opt in.
+
+## Enable
+
+```bash
+# Per-game (Steam launch options):
+ENABLE_HEXSCALE=1 VK_LAYER_PATH=$HOME/.local/share/vulkan/implicit_layer.d %command%
+
+# Whole session (persisted, re-login required):
+mkdir -p ~/.config/environment.d
+cat > ~/.config/environment.d/60-hexscale.conf << EOF
+ENABLE_HEXSCALE=1
+VK_LAYER_PATH=$HOME/.local/share/vulkan/implicit_layer.d
+EOF
+```
+
+Controls:
+* `HEXSCALE_SHARPNESS=0..1` — default 0.5; overridden live by the Decky
+  plugin / daemon.
+* `DISABLE_HEXSCALE=1` — kill switch.
+* The daemon can toggle processing off entirely (layer polls it each second).
+
+## Building from source
+
+```bash
+./scripts/build-shader.sh   # regenerate SPIR-V (needs glslangValidator)
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j$(nproc)
 ```
 
+CI builds natively on `ubuntu-24.04-arm` so the artifacts actually run on the
+handhelds. Tags (`v*`) publish a GitHub release.
+
 ---
 
-## Usage
+## Kernel notes (NPU path only)
 
-### 1. Start the daemon
+1. Qualcomm FastRPC (`CONFIG_QCOM_FASTRPC`), `/dev/fastrpc-cdsp`.
+2. CDSP per-PD scaling (Mukesh Ojha's series — see
+   [armada-packages#66](https://github.com/armada-os/armada-packages/pull/66)).
+3. `CONFIG_DMA_SHARED_BUFFER=y` for zero-copy buffer sharing.
 
-```bash
-# Direct execution
-./build/daemon/hexscaled
-
-# Or via systemd
-sudo systemctl enable --now hexscaled.service
-```
-
-### 2. Run a game with the Vulkan layer
-
-```bash
-export VK_LAYER_PATH="$(pwd)/build/layer:$VK_LAYER_PATH"
-export ENABLE_HEXSCALE=1
-./your_game_or_emulator
-```
-
-### 3. Run standalone benchmark
-
-```bash
-./build/cli/hexscale-cli --bench 200
-```
+GPU sharpening itself needs none of these — only a Vulkan 1.1 driver.
 
 ---
 

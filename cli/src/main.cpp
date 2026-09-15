@@ -64,7 +64,7 @@ void print_status(const hexscale::ipc::ResponsePacket& resp) {
 
 void run_benchmark(uint32_t iterations) {
     std::cout << "=================================================" << std::endl;
-    std::cout << "   Hexscale XLSR-INT8 Latency Benchmark          " << std::endl;
+    std::cout << "   Hexscale CPU Upscaling Latency Benchmark      " << std::endl;
     std::cout << "   Resolution: 1280x720 -> 1920x1080 (RGB24)    " << std::endl;
     std::cout << "   Iterations: " << iterations << std::endl;
     std::cout << "=================================================" << std::endl;
