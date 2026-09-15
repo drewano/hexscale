@@ -84,12 +84,28 @@ Config load_config() {
 
 const Config g_config = load_config();
 
-#define HEX_LOG(...)                                  \
-    do {                                              \
-        if (g_config.debug) {                         \
-            fprintf(stderr, "[hexscale] " __VA_ARGS__); \
-            fputc('\n', stderr);                      \
-        }                                             \
+// Debug output goes to stderr AND /tmp/hexscale-debug.log (gamescope pipes
+// stderr to a socket, which makes on-device triage awkward).
+#define HEX_LOG(...)                                                        \
+    do {                                                                    \
+        if (g_config.debug) {                                               \
+            fprintf(stderr, "[hexscale] " __VA_ARGS__);                     \
+            fputc('\n', stderr);                                            \
+            if (FILE* f = fopen("/tmp/hexscale-debug.log", "a")) {          \
+                fprintf(f, "[hexscale] " __VA_ARGS__);                      \
+                fputc('\n', f);                                             \
+                fclose(f);                                                  \
+            }                                                               \
+        }                                                                   \
+    } while (0)
+
+// One-shot diagnostic helpers (explain WHY frames take the passthrough).
+#define HEX_LOG_ONCE(tag, ...)                          \
+    do {                                                \
+        static std::atomic<bool> seen_##tag{false};     \
+        if (!seen_##tag.exchange(true)) {               \
+            HEX_LOG(__VA_ARGS__);                       \
+        }                                               \
     } while (0)
 
 // ---------------------------------------------------------------------------
@@ -288,6 +304,11 @@ struct DeviceState {
     // Command pool for the CAS submits (lazily created)
     VkCommandPool cmd_pool = VK_NULL_HANDLE;
 
+    // vkQueuePresentKHR resolved once with the DEVICE handle (the canonical
+    // layer pattern): calling a lower layer's gdpa with a QUEUE handle made
+    // the raw loader terminator jump through a null entry (vkcube on device).
+    PFN_vkQueuePresentKHR queue_present_fn = nullptr;
+
     // Per-present bookkeeping. Fences/command buffers are retired as soon as
     // their fence signals; present semaphores additionally wait a bounded
     // number of further presents (a present that consumed them is long done).
@@ -327,6 +348,20 @@ std::unordered_map<VkSwapchainKHR, SwapchainState*> g_swapchains;
 template <typename Fn>
 Fn devfn(DeviceState* ds, const char* name) {
     return reinterpret_cast<Fn>(ds->gdpa(ds->device, name));
+}
+
+// Checked variant: an upper layer's gdpa (e.g. vkroots proxies) may answer
+// nullptr for functions it does not know; calling those crashed vkcube on
+// device (null call straight from our inlined present path). Every pointer
+// used on the present path goes through this and passthrough-fails instead.
+template <typename Fn>
+bool devfn_checked(DeviceState* ds, const char* name, Fn& out) {
+    out = reinterpret_cast<Fn>(ds->gdpa(ds->device, name));
+    if (!out) {
+        HEX_LOG("driver/layer returned null for %s -> passthrough", name);
+        return false;
+    }
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -761,9 +796,54 @@ VkSemaphore try_cas_present(DeviceState* ds, SwapchainState* sc, VkQueue queue,
     if (pPresentInfo->waitSemaphoreCount > kMaxWaitSemaphores) return VK_NULL_HANDLE;
 
     VkDevice dev = ds->device;
-    auto destroy_fence = devfn<PFN_vkDestroyFence>(ds, "vkDestroyFence");
-    auto destroy_sem = devfn<PFN_vkDestroySemaphore>(ds, "vkDestroySemaphore");
-    auto free_cmd = devfn<PFN_vkFreeCommandBuffers>(ds, "vkFreeCommandBuffers");
+
+    // Resolve every function the pass needs before touching anything.
+    PFN_vkDestroyFence destroy_fence = nullptr;
+    PFN_vkDestroySemaphore destroy_sem = nullptr;
+    PFN_vkFreeCommandBuffers free_cmd = nullptr;
+    PFN_vkCreateCommandPool create_pool = nullptr;
+    PFN_vkCreateFence create_fence_fn = nullptr;
+    PFN_vkCreateSemaphore create_sem_fn = nullptr;
+    PFN_vkAllocateCommandBuffers alloc_cmd = nullptr;
+    PFN_vkBeginCommandBuffer begin_cmd = nullptr;
+    PFN_vkCmdResetQueryPool cmd_reset_pool = nullptr;
+    PFN_vkCmdWriteTimestamp cmd_timestamp = nullptr;
+    PFN_vkCmdPipelineBarrier cmd_barrier = nullptr;
+    PFN_vkCmdBeginRenderPass cmd_begin_rp = nullptr;
+    PFN_vkCmdBindPipeline cmd_bind_pl = nullptr;
+    PFN_vkCmdSetViewport cmd_viewport = nullptr;
+    PFN_vkCmdSetScissor cmd_scissor = nullptr;
+    PFN_vkCmdBindDescriptorSets cmd_bind_sets = nullptr;
+    PFN_vkCmdPushConstants cmd_push = nullptr;
+    PFN_vkCmdDraw cmd_draw = nullptr;
+    PFN_vkCmdEndRenderPass cmd_end_rp = nullptr;
+    PFN_vkCmdCopyImage cmd_copy = nullptr;
+    PFN_vkEndCommandBuffer end_cmd = nullptr;
+    PFN_vkQueueSubmit queue_submit = nullptr;
+    if (!devfn_checked(ds, "vkDestroyFence", destroy_fence) ||
+        !devfn_checked(ds, "vkDestroySemaphore", destroy_sem) ||
+        !devfn_checked(ds, "vkFreeCommandBuffers", free_cmd) ||
+        !devfn_checked(ds, "vkCreateCommandPool", create_pool) ||
+        !devfn_checked(ds, "vkCreateFence", create_fence_fn) ||
+        !devfn_checked(ds, "vkCreateSemaphore", create_sem_fn) ||
+        !devfn_checked(ds, "vkAllocateCommandBuffers", alloc_cmd) ||
+        !devfn_checked(ds, "vkBeginCommandBuffer", begin_cmd) ||
+        !devfn_checked(ds, "vkCmdResetQueryPool", cmd_reset_pool) ||
+        !devfn_checked(ds, "vkCmdWriteTimestamp", cmd_timestamp) ||
+        !devfn_checked(ds, "vkCmdPipelineBarrier", cmd_barrier) ||
+        !devfn_checked(ds, "vkCmdBeginRenderPass", cmd_begin_rp) ||
+        !devfn_checked(ds, "vkCmdBindPipeline", cmd_bind_pl) ||
+        !devfn_checked(ds, "vkCmdSetViewport", cmd_viewport) ||
+        !devfn_checked(ds, "vkCmdSetScissor", cmd_scissor) ||
+        !devfn_checked(ds, "vkCmdBindDescriptorSets", cmd_bind_sets) ||
+        !devfn_checked(ds, "vkCmdPushConstants", cmd_push) ||
+        !devfn_checked(ds, "vkCmdDraw", cmd_draw) ||
+        !devfn_checked(ds, "vkCmdEndRenderPass", cmd_end_rp) ||
+        !devfn_checked(ds, "vkCmdCopyImage", cmd_copy) ||
+        !devfn_checked(ds, "vkEndCommandBuffer", end_cmd) ||
+        !devfn_checked(ds, "vkQueueSubmit", queue_submit)) {
+        return VK_NULL_HANDLE;
+    }
 
     const VkPipeline pipeline = (sc->format == VK_FORMAT_B8G8R8A8_UNORM ||
                                  sc->format == VK_FORMAT_B8G8R8A8_SRGB)
@@ -784,8 +864,7 @@ VkSemaphore try_cas_present(DeviceState* ds, SwapchainState* sc, VkQueue queue,
         VkCommandPoolCreateInfo pool_info{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
         pool_info.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
         pool_info.queueFamilyIndex = family;
-        if (devfn<PFN_vkCreateCommandPool>(ds, "vkCreateCommandPool")(
-                dev, &pool_info, nullptr, &ds->cmd_pool) != VK_SUCCESS)
+        if (create_pool(dev, &pool_info, nullptr, &ds->cmd_pool) != VK_SUCCESS)
             return VK_NULL_HANDLE;
     }
 
@@ -811,14 +890,11 @@ VkSemaphore try_cas_present(DeviceState* ds, SwapchainState* sc, VkQueue queue,
         return VK_NULL_HANDLE;
     };
 
-    if (devfn<PFN_vkCreateFence>(ds, "vkCreateFence")(
-            dev, &fence_info, nullptr, &fence) != VK_SUCCESS)
+    if (create_fence_fn(dev, &fence_info, nullptr, &fence) != VK_SUCCESS)
         return VK_NULL_HANDLE;
-    if (devfn<PFN_vkCreateSemaphore>(ds, "vkCreateSemaphore")(
-            dev, &sem_info, nullptr, &semaphore) != VK_SUCCESS)
+    if (create_sem_fn(dev, &sem_info, nullptr, &semaphore) != VK_SUCCESS)
         return fail();
-    if (devfn<PFN_vkAllocateCommandBuffers>(ds, "vkAllocateCommandBuffers")(
-            dev, &cmd_info, &cmd) != VK_SUCCESS)
+    if (alloc_cmd(dev, &cmd_info, &cmd) != VK_SUCCESS)
         return fail();
 
     const uint32_t image_index = pPresentInfo->pImageIndices[0];
@@ -838,15 +914,12 @@ VkSemaphore try_cas_present(DeviceState* ds, SwapchainState* sc, VkQueue queue,
     // --- Record the CAS pass ---
     VkCommandBufferBeginInfo begin_info{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    if (devfn<PFN_vkBeginCommandBuffer>(ds, "vkBeginCommandBuffer")(cmd, &begin_info) !=
-        VK_SUCCESS)
+    if (begin_cmd(cmd, &begin_info) != VK_SUCCESS)
         return fail();
 
     if (want_timing) {
-        devfn<PFN_vkCmdResetQueryPool>(ds, "vkCmdResetQueryPool")(
-            cmd, ds->timing_pool, timing_pair, 2);
-        devfn<PFN_vkCmdWriteTimestamp>(ds, "vkCmdWriteTimestamp")(
-            cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, ds->timing_pool, timing_pair);
+        cmd_reset_pool(cmd, ds->timing_pool, timing_pair, 2);
+        cmd_timestamp(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, ds->timing_pool, timing_pair);
     }
 
     // Swapchain image: PRESENT_SRC -> SHADER_READ (sampled by the pass)
@@ -860,8 +933,7 @@ VkSemaphore try_cas_present(DeviceState* ds, SwapchainState* sc, VkQueue queue,
     to_read.image = swap_image;
     to_read.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
 
-    devfn<PFN_vkCmdPipelineBarrier>(ds, "vkCmdPipelineBarrier")(
-        cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+    cmd_barrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
         0, 0, nullptr, 0, nullptr, 1, &to_read);
 
     // Fullscreen CAS draw into the RGBA8 intermediate; the render pass ends
@@ -872,10 +944,8 @@ VkSemaphore try_cas_present(DeviceState* ds, SwapchainState* sc, VkQueue queue,
     rp_begin.renderArea.offset = {0, 0};
     rp_begin.renderArea.extent = {sc->extent.width, sc->extent.height};
 
-    devfn<PFN_vkCmdBeginRenderPass>(ds, "vkCmdBeginRenderPass")(
-        cmd, &rp_begin, VK_SUBPASS_CONTENTS_INLINE);
-    devfn<PFN_vkCmdBindPipeline>(ds, "vkCmdBindPipeline")(
-        cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+    cmd_begin_rp(cmd, &rp_begin, VK_SUBPASS_CONTENTS_INLINE);
+    cmd_bind_pl(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
 
     VkViewport viewport{};
     viewport.width = static_cast<float>(sc->extent.width);
@@ -884,16 +954,14 @@ VkSemaphore try_cas_present(DeviceState* ds, SwapchainState* sc, VkQueue queue,
     VkRect2D scissor{};
     scissor.offset = {0, 0};
     scissor.extent = {sc->extent.width, sc->extent.height};
-    devfn<PFN_vkCmdSetViewport>(ds, "vkCmdSetViewport")(cmd, 0, 1, &viewport);
-    devfn<PFN_vkCmdSetScissor>(ds, "vkCmdSetScissor")(cmd, 0, 1, &scissor);
+    cmd_viewport(cmd, 0, 1, &viewport);
+    cmd_scissor(cmd, 0, 1, &scissor);
 
-    devfn<PFN_vkCmdBindDescriptorSets>(ds, "vkCmdBindDescriptorSets")(
-        cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, ds->pl, 0, 1, &sc->sets[image_index],
-        0, nullptr);
-    devfn<PFN_vkCmdPushConstants>(ds, "vkCmdPushConstants")(
-        cmd, ds->pl, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(float), &sharpness);
-    devfn<PFN_vkCmdDraw>(ds, "vkCmdDraw")(cmd, 3, 1, 0, 0);
-    devfn<PFN_vkCmdEndRenderPass>(ds, "vkCmdEndRenderPass")(cmd);
+    cmd_bind_sets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, ds->pl, 0, 1,
+                  &sc->sets[image_index], 0, nullptr);
+    cmd_push(cmd, ds->pl, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(float), &sharpness);
+    cmd_draw(cmd, 3, 1, 0, 0);
+    cmd_end_rp(cmd);
 
     // Swap: SHADER_READ -> TRANSFER_DST, verbatim copy from the intermediate
     VkImageMemoryBarrier to_dst{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
@@ -906,17 +974,15 @@ VkSemaphore try_cas_present(DeviceState* ds, SwapchainState* sc, VkQueue queue,
     to_dst.image = swap_image;
     to_dst.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
 
-    devfn<PFN_vkCmdPipelineBarrier>(ds, "vkCmdPipelineBarrier")(
-        cmd, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+    cmd_barrier(cmd, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
         0, 0, nullptr, 0, nullptr, 1, &to_dst);
 
     VkImageCopy region{};
     region.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
     region.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
     region.extent = {sc->extent.width, sc->extent.height, 1};
-    devfn<PFN_vkCmdCopyImage>(ds, "vkCmdCopyImage")(
-        cmd, sc->intermediate, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-        swap_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+    cmd_copy(cmd, sc->intermediate, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+             swap_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
 
     // Swap: TRANSFER_DST -> PRESENT_SRC, ready for the real present
     VkImageMemoryBarrier to_present{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
@@ -929,16 +995,14 @@ VkSemaphore try_cas_present(DeviceState* ds, SwapchainState* sc, VkQueue queue,
     to_present.image = swap_image;
     to_present.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
 
-    devfn<PFN_vkCmdPipelineBarrier>(ds, "vkCmdPipelineBarrier")(
-        cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+    cmd_barrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
         0, 0, nullptr, 0, nullptr, 1, &to_present);
 
     if (want_timing) {
-        devfn<PFN_vkCmdWriteTimestamp>(ds, "vkCmdWriteTimestamp")(
-            cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, ds->timing_pool, timing_pair + 1);
+        cmd_timestamp(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, ds->timing_pool, timing_pair + 1);
     }
 
-    if (devfn<PFN_vkEndCommandBuffer>(ds, "vkEndCommandBuffer")(cmd) != VK_SUCCESS)
+    if (end_cmd(cmd) != VK_SUCCESS)
         return fail();
 
     // --- Submit: waits for the app's semaphores, signals our own ---
@@ -955,7 +1019,7 @@ VkSemaphore try_cas_present(DeviceState* ds, SwapchainState* sc, VkQueue queue,
     submit.signalSemaphoreCount = 1;
     submit.pSignalSemaphores = &semaphore;
 
-    if (devfn<PFN_vkQueueSubmit>(ds, "vkQueueSubmit")(queue, 1, &submit, fence) != VK_SUCCESS)
+    if (queue_submit(queue, 1, &submit, fence) != VK_SUCCESS)
         return fail();
 
     ds->present_counter++;
@@ -1107,6 +1171,9 @@ VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL hexscale_vkCreateDevice(
         }
     }
 
+    ds->queue_present_fn =
+        (PFN_vkQueuePresentKHR)next_gdpa(*pDevice, "vkQueuePresentKHR");
+
     {
         // Device tracked; the CAS pipeline is built lazily at the first
         // swapchain creation — creating objects from inside this hook ran
@@ -1222,9 +1289,10 @@ VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL hexscale_vkCreateSwapchainKHR(
     if (!next_create) return VK_ERROR_INITIALIZATION_FAILED;
 
     if (!g_config.enabled || !ds || !format_ok) {
-        if (g_config.debug && !format_ok) {
-            HEX_LOG("swapchain format %u unsupported -> passthrough",
-                    static_cast<uint32_t>(pCreateInfo->imageFormat));
+        if (!format_ok) {
+            HEX_LOG_ONCE(fmt_unsupported,
+                         "swapchain format %u unsupported -> passthrough",
+                         static_cast<uint32_t>(pCreateInfo->imageFormat));
         }
         return next_create(device, pCreateInfo, pAllocator, pSwapchain);
     }
@@ -1313,6 +1381,11 @@ VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL hexscale_vkQueuePresentKHR(
     DeviceState* ds = nullptr;
     SwapchainState* sc = nullptr;
 
+    if (g_config.debug && pPresentInfo->swapchainCount != 1) {
+        HEX_LOG_ONCE(multi_swapchain, "present with %u swapchains -> passthrough",
+                     pPresentInfo->swapchainCount);
+    }
+
     if (g_config.enabled && g_daemon_active.load() &&
         pPresentInfo->swapchainCount == 1 && pPresentInfo->pSwapchains &&
         pPresentInfo->pImageIndices) {
@@ -1331,20 +1404,23 @@ VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL hexscale_vkQueuePresentKHR(
         }
     }
 
-    PFN_vkQueuePresentKHR next_present = nullptr;
-    {
+    if (!ds) {
+        // No tracked device for this queue: pick the single one (handhelds).
         std::lock_guard<std::mutex> lock(g_lock);
-        auto it = g_device_dispatch.find(get_dispatch_key(queue));
-        if (it != g_device_dispatch.end() && it->second) {
-            next_present = (PFN_vkQueuePresentKHR)it->second(
-                reinterpret_cast<VkDevice>(queue), "vkQueuePresentKHR");
-        } else if (!g_device_dispatch.empty()) {
-            next_present = (PFN_vkQueuePresentKHR)
-                g_device_dispatch.begin()->second(
-                    reinterpret_cast<VkDevice>(queue), "vkQueuePresentKHR");
+        if (!g_devices.empty()) ds = g_devices.begin()->second;
+    }
+    if (!ds || !ds->queue_present_fn) {
+        return VK_SUCCESS; // cannot forward: fail-open
+    }
+    PFN_vkQueuePresentKHR next_present = ds->queue_present_fn;
+
+    if (g_config.debug && pPresentInfo->swapchainCount == 1 &&
+        pPresentInfo->pSwapchains) {
+        std::lock_guard<std::mutex> lock(g_lock);
+        if (g_swapchains.find(pPresentInfo->pSwapchains[0]) == g_swapchains.end()) {
+            HEX_LOG_ONCE(untracked_sw, "present on untracked swapchain -> passthrough");
         }
     }
-    if (!next_present) return VK_SUCCESS; // cannot forward: fail-open
 
     if (ds && sc && sc->usable && pPresentInfo->pImageIndices[0] < sc->image_count) {
         VkSemaphore our_sem = try_cas_present(ds, sc, queue, pPresentInfo);
