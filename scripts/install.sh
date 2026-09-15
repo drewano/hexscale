@@ -14,7 +14,9 @@ mkdir -p "$DEST_BIN" "$DEST_LIB" "$DEST_LAYER"
 
 install -m 0755 bin/hexscaled "$DEST_BIN/hexscaled"
 install -m 0755 bin/hexscale-cli "$DEST_BIN/hexscale-cli"
-install -m 0755 layer/libVkLayer_hexscale.so "$DEST_LIB/libVkLayer_hexscale.so"
+# library_path is resolved relative to the manifest: lib and json live
+# together in the layer directory.
+install -m 0755 layer/libVkLayer_hexscale.so "$DEST_LAYER/libVkLayer_hexscale.so"
 install -m 0644 layer/VkLayer_hexscale.json "$DEST_LAYER/VkLayer_hexscale.json"
 
 # Daemon service (user-level, socket in XDG_RUNTIME_DIR; no root needed).
