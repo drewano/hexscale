@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Regenerate layer/src/cas_spv.h from layer/src/cas.comp.
+# Regenerate layer/src/cas_spv.h from layer/src/cas.vert and cas.frag.
 # Requires glslangValidator (glslang-tools package / homebrew glslang).
 set -euo pipefail
 
@@ -9,17 +9,30 @@ command -v glslangValidator >/dev/null || {
     exit 1
 }
 
-tmp="$(mktemp)"
-glslangValidator -V --target-env vulkan1.1 -x layer/src/cas.comp -o "$tmp"
+tmpdir="$(mktemp -d)"
+trap 'rm -rf "$tmpdir"' EXIT
 
-python3 - "$tmp" << 'EOF'
-import sys
-body = open(sys.argv[1]).read().strip()
-words = [w.strip() for w in body.replace('\n', ' ').split(',') if w.strip()]
-lines = [', '.join(words[i:i + 8]) for i in range(0, len(words), 8)]
-out = '/* Generated from cas.comp by glslangValidator (scripts/build-shader.sh). Do not edit. */\n'
-out += 'static const uint32_t k_cas_spv[] = {\n    ' + ',\n    '.join(lines) + '\n};\n'
-open('layer/src/cas_spv.h', 'w').write(out)
-print(f"layer/src/cas_spv.h: {len(words)} words")
-EOF
-rm -f "$tmp"
+glslangValidator -V --target-env vulkan1.1 -o "$tmpdir/cas.vert.spv" layer/src/cas.vert
+glslangValidator -V --target-env vulkan1.1 -o "$tmpdir/cas.frag.spv" layer/src/cas.frag
+glslangValidator -V --target-env vulkan1.1 -DSWAP_RB -o "$tmpdir/cas_bgra.frag.spv" layer/src/cas.frag
+
+python3 - "$tmpdir" << 'PYEOF'
+import struct, sys
+
+def to_header(spv_path, name):
+    spv = open(spv_path, 'rb').read()
+    words = struct.unpack('<%dI' % (len(spv) // 4), spv)
+    lines = [', '.join('0x%08x' % w for w in words[i:i + 8])
+             for i in range(0, len(words), 8)]
+    return ('/* Generated from layer/src/cas.vert / cas.frag by scripts/build-shader.sh. '
+            'Do not edit. */\nstatic const uint32_t %s[] = {\n    ' % name) \
+        + ',\n    '.join(lines) + '\n};\n'
+
+parts = [
+    to_header(sys.argv[1] + '/cas.vert.spv', 'k_cas_vert_spv'),
+    to_header(sys.argv[1] + '/cas.frag.spv', 'k_cas_frag_spv'),
+    to_header(sys.argv[1] + '/cas_bgra.frag.spv', 'k_cas_frag_bgra_spv'),
+]
+open('layer/src/cas_spv.h', 'w').write('\n'.join(parts))
+print('layer/src/cas_spv.h regenerated')
+PYEOF

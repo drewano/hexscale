@@ -8,11 +8,16 @@
 //   2. The present path never blocks: telemetry runs on a background thread,
 //      Vulkan work is submitted fire-and-forget with deferred destruction.
 //   3. Processing happens in-place on the swapchain image (CAS into an
-//      intermediate image -> copy back), so compositor-side upscaling and
+//      RGBA8 target -> verbatim copy back), so compositor-side upscaling and
 //      present timing are untouched.
+//   4. The pass is a fragment-shader fullscreen triangle sampling the frame
+//      through a native-format view — works for RGBA and BGRA swapchains
+//      alike (gamescope presents BGRA on KMS planes). The BGRA variant
+//      pre-swizzles its output so the verbatim copy-back lands correctly.
 //
 // Enabled with ENABLE_HEXSCALE=1 (manifest), killed with DISABLE_HEXSCALE=1,
-// sharpness with HEXSCALE_SHARPNESS=0..1 (or live from the daemon / QAM).
+// sharpness with HEXSCALE_SHARPNESS=0..1 (or live from the daemon / QAM),
+// debug logging with HEXSCALE_DEBUG=1.
 
 #include <vulkan/vulkan.h>
 #include <vulkan/vk_layer.h>
@@ -20,6 +25,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
@@ -42,13 +48,13 @@
 #define VK_LAYER_EXPORT __attribute__((visibility("default")))
 #endif
 
-// SPIR-V for cas.comp (see scripts/build-shader.sh to regenerate).
+// SPIR-V for cas.vert / cas.frag (see scripts/build-shader.sh to regenerate).
 #include "cas_spv.h"
 
 namespace {
 
-constexpr uint32_t kMaxSwapchainImages = 8;   // DXVK/gamescope use 2-4
-constexpr uint32_t kMaxWaitSemaphores = 8;    // more -> passthrough
+constexpr uint32_t kMaxSwapchainImages = 8;    // DXVK/gamescope use 2-4
+constexpr uint32_t kMaxWaitSemaphores = 8;     // more -> passthrough
 constexpr uint64_t kSemaphoreRetireDelay = 30; // presents before destroying
 
 // ---------------------------------------------------------------------------
@@ -57,6 +63,7 @@ constexpr uint64_t kSemaphoreRetireDelay = 30; // presents before destroying
 
 struct Config {
     bool enabled = true;      // DISABLE_HEXSCALE=1 kills every interception
+    bool debug = false;       // HEXSCALE_DEBUG=1 -> stderr diagnostics
     float sharpness = 0.5f;   // HEXSCALE_SHARPNESS 0..1
 };
 
@@ -64,6 +71,9 @@ Config load_config() {
     Config c;
     if (const char* v = getenv("DISABLE_HEXSCALE")) {
         if (v[0] == '1' && v[1] == '\0') c.enabled = false;
+    }
+    if (const char* v = getenv("HEXSCALE_DEBUG")) {
+        if (v[0] == '1' && v[1] == '\0') c.debug = true;
     }
     if (const char* v = getenv("HEXSCALE_SHARPNESS")) {
         float f = strtof(v, nullptr);
@@ -73,6 +83,14 @@ Config load_config() {
 }
 
 const Config g_config = load_config();
+
+#define HEX_LOG(...)                                  \
+    do {                                              \
+        if (g_config.debug) {                         \
+            fprintf(stderr, "[hexscale] " __VA_ARGS__); \
+            fputc('\n', stderr);                      \
+        }                                             \
+    } while (0)
 
 // ---------------------------------------------------------------------------
 // Global state
@@ -175,8 +193,8 @@ private:
     static bool rpc(const hexscale::ipc::CommandPacket& cmd,
                     hexscale::ipc::ResponsePacket& resp) {
         int sock = ::socket(AF_UNIX, SOCK_STREAM, 0);
-        ::fcntl(sock, F_SETFD, FD_CLOEXEC);
         if (sock < 0) return false;
+        ::fcntl(sock, F_SETFD, FD_CLOEXEC);
 
         struct sockaddr_un addr{};
         if (!fill_socket_path(addr)) {
@@ -250,12 +268,15 @@ struct DeviceState {
     PFN_vkGetDeviceProcAddr gdpa = nullptr;
     float timestamp_period_ns = 1.0f;
 
-    // CAS pipeline shared by every swapchain of this device
+    // CAS resources shared by every swapchain of this device
     VkDescriptorPool descriptor_pool = VK_NULL_HANDLE;
     VkDescriptorSetLayout dsl = VK_NULL_HANDLE;
     VkPipelineLayout pl = VK_NULL_HANDLE;
-    VkPipeline pipeline = VK_NULL_HANDLE;
-    bool pipeline_failed = false; // one failed attempt -> inert for this device
+    VkRenderPass render_pass = VK_NULL_HANDLE;
+    VkSampler sampler = VK_NULL_HANDLE;
+    VkPipeline pipeline = VK_NULL_HANDLE;       // RGBA swapchains
+    VkPipeline pipeline_bgra = VK_NULL_HANDLE;  // BGRA swapchains
+    bool pipeline_failed = false;               // one failed attempt -> inert
     VkQueryPool timing_pool = VK_NULL_HANDLE;
     uint32_t timing_seq = 0;
 
@@ -288,10 +309,11 @@ struct SwapchainState {
     uint32_t image_count = 0;
     VkImage images[kMaxSwapchainImages] = {};
 
-    // CAS resources (intermediate target + per-image input views/sets)
+    // CAS resources: RGBA8 target (+framebuffer), sampled views/sets per image
     VkImage intermediate = VK_NULL_HANDLE;
     VkDeviceMemory intermediate_mem = VK_NULL_HANDLE;
     VkImageView out_view = VK_NULL_HANDLE;
+    VkFramebuffer framebuffer = VK_NULL_HANDLE;
     VkImageView in_views[kMaxSwapchainImages] = {};
     VkDescriptorSet sets[kMaxSwapchainImages] = {};
 
@@ -316,28 +338,39 @@ bool create_cas_pipeline(DeviceState* ds) {
     auto create_dsl = devfn<PFN_vkCreateDescriptorSetLayout>(ds, "vkCreateDescriptorSetLayout");
     auto create_pl = devfn<PFN_vkCreatePipelineLayout>(ds, "vkCreatePipelineLayout");
     auto create_module = devfn<PFN_vkCreateShaderModule>(ds, "vkCreateShaderModule");
-    auto create_pipelines = devfn<PFN_vkCreateComputePipelines>(ds, "vkCreateComputePipelines");
+    auto create_pipelines = devfn<PFN_vkCreateGraphicsPipelines>(ds, "vkCreateGraphicsPipelines");
     auto destroy_module = devfn<PFN_vkDestroyShaderModule>(ds, "vkDestroyShaderModule");
+    auto create_rp = devfn<PFN_vkCreateRenderPass>(ds, "vkCreateRenderPass");
+    auto create_sampler = devfn<PFN_vkCreateSampler>(ds, "vkCreateSampler");
     auto create_query_pool = devfn<PFN_vkCreateQueryPool>(ds, "vkCreateQueryPool");
 
-    VkDescriptorSetLayoutBinding bindings[2]{};
-    bindings[0].binding = 0;
-    bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-    bindings[0].descriptorCount = 1;
-    bindings[0].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-    bindings[1].binding = 1;
-    bindings[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-    bindings[1].descriptorCount = 1;
-    bindings[1].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    // Trivial sampler (texelFetch ignores filtering, the descriptor just
+    // needs a valid one).
+    VkSamplerCreateInfo sampler_info{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+    sampler_info.magFilter = VK_FILTER_NEAREST;
+    sampler_info.minFilter = VK_FILTER_NEAREST;
+    sampler_info.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    sampler_info.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    sampler_info.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    sampler_info.maxLod = VK_LOD_CLAMP_NONE;
+    if (create_sampler(dev, &sampler_info, nullptr, &ds->sampler) != VK_SUCCESS)
+        return false;
+
+    VkDescriptorSetLayoutBinding binding{};
+    binding.binding = 0;
+    binding.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    binding.descriptorCount = 1;
+    binding.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    binding.pImmutableSamplers = nullptr;
 
     VkDescriptorSetLayoutCreateInfo dsl_info{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    dsl_info.bindingCount = 2;
-    dsl_info.pBindings = bindings;
+    dsl_info.bindingCount = 1;
+    dsl_info.pBindings = &binding;
     if (create_dsl(dev, &dsl_info, nullptr, &ds->dsl) != VK_SUCCESS)
         return false;
 
     VkPushConstantRange pc{};
-    pc.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    pc.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
     pc.offset = 0;
     pc.size = sizeof(float);
 
@@ -349,22 +382,117 @@ bool create_cas_pipeline(DeviceState* ds) {
     if (create_pl(dev, &pl_info, nullptr, &ds->pl) != VK_SUCCESS)
         return false;
 
-    VkShaderModuleCreateInfo sm_info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
-    sm_info.codeSize = sizeof(k_cas_spv);
-    sm_info.pCode = k_cas_spv;
-    VkShaderModule module = VK_NULL_HANDLE;
-    if (create_module(dev, &sm_info, nullptr, &module) != VK_SUCCESS)
+    // Render pass: single RGBA8 attachment, contents discarded on load,
+    // handed over to the copy in TRANSFER_SRC layout at the end.
+    VkAttachmentDescription attach{};
+    attach.format = VK_FORMAT_R8G8B8A8_UNORM;
+    attach.samples = VK_SAMPLE_COUNT_1_BIT;
+    attach.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    attach.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    attach.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    attach.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    attach.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    attach.finalLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+
+    VkAttachmentReference color_ref{};
+    color_ref.attachment = 0;
+    color_ref.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+
+    VkSubpassDescription subpass{};
+    subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+    subpass.colorAttachmentCount = 1;
+    subpass.pColorAttachments = &color_ref;
+
+    VkRenderPassCreateInfo rp_info{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
+    rp_info.attachmentCount = 1;
+    rp_info.pAttachments = &attach;
+    rp_info.subpassCount = 1;
+    rp_info.pSubpasses = &subpass;
+    if (create_rp(dev, &rp_info, nullptr, &ds->render_pass) != VK_SUCCESS)
         return false;
 
-    VkComputePipelineCreateInfo cp_info{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
-    cp_info.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    cp_info.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-    cp_info.stage.module = module;
-    cp_info.stage.pName = "main";
-    cp_info.layout = ds->pl;
-    VkResult r = create_pipelines(dev, VK_NULL_HANDLE, 1, &cp_info, nullptr, &ds->pipeline);
-    destroy_module(dev, module, nullptr);
-    if (r != VK_SUCCESS) return false;
+    // Shader modules
+    auto make_module = [&](const uint32_t* code, size_t bytes, VkShaderModule& out) {
+        VkShaderModuleCreateInfo sm{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+        sm.codeSize = bytes;
+        sm.pCode = code;
+        return create_module(dev, &sm, nullptr, &out) == VK_SUCCESS;
+    };
+    VkShaderModule vs = VK_NULL_HANDLE, fs = VK_NULL_HANDLE, fs_bgra = VK_NULL_HANDLE;
+    if (!make_module(k_cas_vert_spv, sizeof(k_cas_vert_spv), vs)) return false;
+    if (!make_module(k_cas_frag_spv, sizeof(k_cas_frag_spv), fs)) return false;
+    if (!make_module(k_cas_frag_bgra_spv, sizeof(k_cas_frag_bgra_spv), fs_bgra)) return false;
+
+    // Graphics pipeline: fullscreen triangle, dynamic viewport/scissor.
+    VkPipelineShaderStageCreateInfo stages[2]{};
+    stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+    stages[0].module = vs;
+    stages[0].pName = "main";
+    stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+    stages[1].module = fs;
+    stages[1].pName = "main";
+
+    VkPipelineVertexInputStateCreateInfo vertex_input{
+        VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+    VkPipelineInputAssemblyStateCreateInfo input_asm{
+        VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+    input_asm.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+
+    VkPipelineViewportStateCreateInfo viewport_state{
+        VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+    viewport_state.viewportCount = 1;
+    viewport_state.scissorCount = 1;
+
+    VkPipelineRasterizationStateCreateInfo raster{
+        VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+    raster.polygonMode = VK_POLYGON_MODE_FILL;
+    raster.cullMode = VK_CULL_MODE_NONE;
+    raster.lineWidth = 1.0f;
+
+    VkPipelineMultisampleStateCreateInfo multisample{
+        VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+    multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+
+    VkPipelineColorBlendAttachmentState blend_attach{};
+    blend_attach.blendEnable = VK_FALSE;
+    blend_attach.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                                  VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+
+    VkPipelineColorBlendStateCreateInfo blend{
+        VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+    blend.attachmentCount = 1;
+    blend.pAttachments = &blend_attach;
+
+    VkDynamicState dyn_states[2] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+    VkPipelineDynamicStateCreateInfo dynamic{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+    dynamic.dynamicStateCount = 2;
+    dynamic.pDynamicStates = dyn_states;
+
+    VkGraphicsPipelineCreateInfo gp_info{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+    gp_info.stageCount = 2;
+    gp_info.pStages = stages;
+    gp_info.pVertexInputState = &vertex_input;
+    gp_info.pInputAssemblyState = &input_asm;
+    gp_info.pViewportState = &viewport_state;
+    gp_info.pRasterizationState = &raster;
+    gp_info.pMultisampleState = &multisample;
+    gp_info.pColorBlendState = &blend;
+    gp_info.pDynamicState = &dynamic;
+    gp_info.layout = ds->pl;
+    gp_info.renderPass = ds->render_pass;
+    gp_info.subpass = 0;
+
+    VkResult r1 = create_pipelines(dev, VK_NULL_HANDLE, 1, &gp_info, nullptr, &ds->pipeline);
+    stages[1].module = fs_bgra;
+    VkResult r2 =
+        create_pipelines(dev, VK_NULL_HANDLE, 1, &gp_info, nullptr, &ds->pipeline_bgra);
+
+    destroy_module(dev, vs, nullptr);
+    destroy_module(dev, fs, nullptr);
+    destroy_module(dev, fs_bgra, nullptr);
+    if (r1 != VK_SUCCESS || r2 != VK_SUCCESS) return false;
 
     if (ds->any_gfx_compute_timestamp_bits >= 1) {
         VkQueryPoolCreateInfo qp_info{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
@@ -374,6 +502,8 @@ bool create_cas_pipeline(DeviceState* ds) {
             ds->timing_pool = VK_NULL_HANDLE; // timing is optional
     }
 
+    HEX_LOG("CAS pipelines created (timestamp pool: %s)",
+            ds->timing_pool ? "yes" : "no");
     return true;
 }
 
@@ -385,7 +515,7 @@ bool allocate_descriptor_sets(DeviceState* ds, SwapchainState* sc) {
 
     if (ds->descriptor_pool == VK_NULL_HANDLE) {
         VkDescriptorPoolSize pool_sizes[1]{};
-        pool_sizes[0].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        pool_sizes[0].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
         pool_sizes[0].descriptorCount = 4 * kMaxSwapchainImages; // a few swapchains
         VkDescriptorPoolCreateInfo dp_info{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
         dp_info.maxSets = 4 * kMaxSwapchainImages;
@@ -404,26 +534,18 @@ bool allocate_descriptor_sets(DeviceState* ds, SwapchainState* sc) {
         return false;
 
     for (uint32_t i = 0; i < sc->image_count; i++) {
-        VkDescriptorImageInfo infos[2]{};
-        infos[0].imageView = sc->in_views[i];
-        infos[0].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-        infos[1].imageView = sc->out_view;
-        infos[1].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+        VkDescriptorImageInfo info{};
+        info.sampler = ds->sampler;
+        info.imageView = sc->in_views[i];
+        info.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 
-        VkWriteDescriptorSet writes[2]{};
-        writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        writes[0].dstSet = sc->sets[i];
-        writes[0].dstBinding = 0;
-        writes[0].descriptorCount = 1;
-        writes[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-        writes[0].pImageInfo = &infos[0];
-        writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        writes[1].dstSet = sc->sets[i];
-        writes[1].dstBinding = 1;
-        writes[1].descriptorCount = 1;
-        writes[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-        writes[1].pImageInfo = &infos[1];
-        update_sets(dev, 2, writes, 0, nullptr);
+        VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        write.dstSet = sc->sets[i];
+        write.dstBinding = 0;
+        write.descriptorCount = 1;
+        write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        write.pImageInfo = &info;
+        update_sets(dev, 1, &write, 0, nullptr);
     }
     return true;
 }
@@ -436,10 +558,11 @@ void create_swapchain_resources(DeviceState* ds, SwapchainState* sc) {
     auto vkAllocateMemory = devfn<PFN_vkAllocateMemory>(ds, "vkAllocateMemory");
     auto vkBindImageMemory = devfn<PFN_vkBindImageMemory>(ds, "vkBindImageMemory");
     auto vkCreateImageView = devfn<PFN_vkCreateImageView>(ds, "vkCreateImageView");
+    auto vkCreateFramebuffer = devfn<PFN_vkCreateFramebuffer>(ds, "vkCreateFramebuffer");
 
-    // Intermediate target: RGBA8, storage-writable + copy source. On SRGB
-    // swapchains the shader works on raw bytes (UNORM views) and the final
-    // copy restores them verbatim, so the roundtrip is lossless.
+    // RGBA8 target: color attachment for the CAS pass + copy source. On
+    // BGRA swapchains the shader pre-swizzles so the verbatim copy-back is
+    // correct; on SRGB swapchains raw bytes roundtrip unchanged.
     VkImageCreateInfo img_info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
     img_info.imageType = VK_IMAGE_TYPE_2D;
     img_info.format = VK_FORMAT_R8G8B8A8_UNORM;
@@ -448,7 +571,7 @@ void create_swapchain_resources(DeviceState* ds, SwapchainState* sc) {
     img_info.arrayLayers = 1;
     img_info.samples = VK_SAMPLE_COUNT_1_BIT;
     img_info.tiling = VK_IMAGE_TILING_OPTIMAL;
-    img_info.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+    img_info.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
     img_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     if (vkCreateImage(dev, &img_info, nullptr, &sc->intermediate) != VK_SUCCESS) return;
 
@@ -474,21 +597,35 @@ void create_swapchain_resources(DeviceState* ds, SwapchainState* sc) {
     if (vkBindImageMemory(dev, sc->intermediate, sc->intermediate_mem, 0) != VK_SUCCESS)
         return;
 
-    auto make_view = [&](VkImage image, VkImageView& out) {
+    auto make_view = [&](VkImage image, VkFormat format, VkImageView& out) {
         VkImageViewCreateInfo view_info{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
         view_info.image = image;
         view_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
-        view_info.format = VK_FORMAT_R8G8B8A8_UNORM; // UNORM view even on SRGB
+        view_info.format = format; // native format: sampling handles BGRA fine
         view_info.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
         return vkCreateImageView(dev, &view_info, nullptr, &out) == VK_SUCCESS;
     };
 
-    if (!make_view(sc->intermediate, sc->out_view)) return;
+    if (!make_view(sc->intermediate, VK_FORMAT_R8G8B8A8_UNORM, sc->out_view)) return;
+    // Input views keep the swapchain's own format (SRGB included: raw bytes
+    // are read as-is and written back verbatim).
     for (uint32_t i = 0; i < sc->image_count; i++) {
-        if (!make_view(sc->images[i], sc->in_views[i])) return;
+        if (!make_view(sc->images[i], sc->format, sc->in_views[i])) return;
     }
 
+    VkFramebufferCreateInfo fb_info{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
+    fb_info.renderPass = ds->render_pass;
+    fb_info.attachmentCount = 1;
+    fb_info.pAttachments = &sc->out_view;
+    fb_info.width = sc->extent.width;
+    fb_info.height = sc->extent.height;
+    fb_info.layers = 1;
+    if (vkCreateFramebuffer(dev, &fb_info, nullptr, &sc->framebuffer) != VK_SUCCESS)
+        return;
+
     sc->usable = allocate_descriptor_sets(ds, sc);
+    HEX_LOG("swapchain %ux%u fmt=%u: %s", sc->extent.width, sc->extent.height,
+            static_cast<uint32_t>(sc->format), sc->usable ? "ready" : "FAILED");
 }
 
 void destroy_swapchain_resources(DeviceState* ds, SwapchainState* sc) {
@@ -502,6 +639,10 @@ void destroy_swapchain_resources(DeviceState* ds, SwapchainState* sc) {
         if (sc->in_views[i]) destroy_view(dev, sc->in_views[i], nullptr);
     }
     if (sc->out_view) destroy_view(dev, sc->out_view, nullptr);
+    if (sc->framebuffer) {
+        devfn<PFN_vkDestroyFramebuffer>(ds, "vkDestroyFramebuffer")(
+            dev, sc->framebuffer, nullptr);
+    }
     if (sc->intermediate) {
         devfn<PFN_vkDestroyImage>(ds, "vkDestroyImage")(dev, sc->intermediate, nullptr);
     }
@@ -583,6 +724,15 @@ void destroy_device_state(DeviceState* ds) {
         if (ds->pipeline) {
             devfn<PFN_vkDestroyPipeline>(ds, "vkDestroyPipeline")(dev, ds->pipeline, nullptr);
         }
+        if (ds->pipeline_bgra) {
+            devfn<PFN_vkDestroyPipeline>(ds, "vkDestroyPipeline")(dev, ds->pipeline_bgra, nullptr);
+        }
+        if (ds->sampler) {
+            devfn<PFN_vkDestroySampler>(ds, "vkDestroySampler")(dev, ds->sampler, nullptr);
+        }
+        if (ds->render_pass) {
+            devfn<PFN_vkDestroyRenderPass>(ds, "vkDestroyRenderPass")(dev, ds->render_pass, nullptr);
+        }
         if (ds->pl) {
             devfn<PFN_vkDestroyPipelineLayout>(ds, "vkDestroyPipelineLayout")(
                 dev, ds->pl, nullptr);
@@ -614,6 +764,12 @@ VkSemaphore try_cas_present(DeviceState* ds, SwapchainState* sc, VkQueue queue,
     auto destroy_fence = devfn<PFN_vkDestroyFence>(ds, "vkDestroyFence");
     auto destroy_sem = devfn<PFN_vkDestroySemaphore>(ds, "vkDestroySemaphore");
     auto free_cmd = devfn<PFN_vkFreeCommandBuffers>(ds, "vkFreeCommandBuffers");
+
+    const VkPipeline pipeline = (sc->format == VK_FORMAT_B8G8R8A8_UNORM ||
+                                 sc->format == VK_FORMAT_B8G8R8A8_SRGB)
+                                    ? ds->pipeline_bgra
+                                    : ds->pipeline;
+    if (!pipeline) return VK_NULL_HANDLE;
 
     // Queue family for the submits (tracked via vkGetDeviceQueue hooks).
     uint32_t family = UINT32_MAX;
@@ -693,70 +849,66 @@ VkSemaphore try_cas_present(DeviceState* ds, SwapchainState* sc, VkQueue queue,
             cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, ds->timing_pool, timing_pair);
     }
 
-    // Swapchain image: PRESENT_SRC -> GENERAL (compute read)
-    VkImageMemoryBarrier to_general{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
-    to_general.srcAccessMask = VK_ACCESS_MEMORY_READ_BIT;
-    to_general.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-    to_general.oldLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
-    to_general.newLayout = VK_IMAGE_LAYOUT_GENERAL;
-    to_general.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    to_general.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    to_general.image = swap_image;
-    to_general.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    // Swapchain image: PRESENT_SRC -> SHADER_READ (sampled by the pass)
+    VkImageMemoryBarrier to_read{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    to_read.srcAccessMask = VK_ACCESS_MEMORY_READ_BIT;
+    to_read.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    to_read.oldLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    to_read.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    to_read.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    to_read.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    to_read.image = swap_image;
+    to_read.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
 
-    // Intermediate: UNDEFINED -> GENERAL (compute write)
-    VkImageMemoryBarrier mid_barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
-    mid_barrier.srcAccessMask = 0;
-    mid_barrier.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-    mid_barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    mid_barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
-    mid_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    mid_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    mid_barrier.image = sc->intermediate;
-    mid_barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-
-    VkImageMemoryBarrier both[2] = {to_general, mid_barrier};
     devfn<PFN_vkCmdPipelineBarrier>(ds, "vkCmdPipelineBarrier")(
-        cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-        0, 0, nullptr, 0, nullptr, 2, both);
+        cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+        0, 0, nullptr, 0, nullptr, 1, &to_read);
 
+    // Fullscreen CAS draw into the RGBA8 intermediate; the render pass ends
+    // with the target in TRANSFER_SRC layout.
+    VkRenderPassBeginInfo rp_begin{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+    rp_begin.renderPass = ds->render_pass;
+    rp_begin.framebuffer = sc->framebuffer;
+    rp_begin.renderArea.offset = {0, 0};
+    rp_begin.renderArea.extent = {sc->extent.width, sc->extent.height};
+
+    devfn<PFN_vkCmdBeginRenderPass>(ds, "vkCmdBeginRenderPass")(
+        cmd, &rp_begin, VK_SUBPASS_CONTENTS_INLINE);
     devfn<PFN_vkCmdBindPipeline>(ds, "vkCmdBindPipeline")(
-        cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ds->pipeline);
+        cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+
+    VkViewport viewport{};
+    viewport.width = static_cast<float>(sc->extent.width);
+    viewport.height = static_cast<float>(sc->extent.height);
+    viewport.maxDepth = 1.0f;
+    VkRect2D scissor{};
+    scissor.offset = {0, 0};
+    scissor.extent = {sc->extent.width, sc->extent.height};
+    devfn<PFN_vkCmdSetViewport>(ds, "vkCmdSetViewport")(cmd, 0, 1, &viewport);
+    devfn<PFN_vkCmdSetScissor>(ds, "vkCmdSetScissor")(cmd, 0, 1, &scissor);
+
     devfn<PFN_vkCmdBindDescriptorSets>(ds, "vkCmdBindDescriptorSets")(
-        cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ds->pl, 0, 1, &sc->sets[image_index],
+        cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, ds->pl, 0, 1, &sc->sets[image_index],
         0, nullptr);
     devfn<PFN_vkCmdPushConstants>(ds, "vkCmdPushConstants")(
-        cmd, ds->pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(float), &sharpness);
+        cmd, ds->pl, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(float), &sharpness);
+    devfn<PFN_vkCmdDraw>(ds, "vkCmdDraw")(cmd, 3, 1, 0, 0);
+    devfn<PFN_vkCmdEndRenderPass>(ds, "vkCmdEndRenderPass")(cmd);
 
-    uint32_t groups_x = (sc->extent.width + 7) / 8;
-    uint32_t groups_y = (sc->extent.height + 7) / 8;
-    devfn<PFN_vkCmdDispatch>(ds, "vkCmdDispatch")(cmd, groups_x, groups_y, 1);
+    // Swap: SHADER_READ -> TRANSFER_DST, verbatim copy from the intermediate
+    VkImageMemoryBarrier to_dst{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    to_dst.srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    to_dst.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    to_dst.oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    to_dst.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    to_dst.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    to_dst.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    to_dst.image = swap_image;
+    to_dst.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
 
-    // Intermediate: GENERAL -> TRANSFER_SRC ; swap: GENERAL -> TRANSFER_DST
-    VkImageMemoryBarrier mid_to_copy{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
-    mid_to_copy.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-    mid_to_copy.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-    mid_to_copy.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
-    mid_to_copy.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-    mid_to_copy.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    mid_to_copy.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    mid_to_copy.image = sc->intermediate;
-    mid_to_copy.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-
-    VkImageMemoryBarrier swap_to_dst{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
-    swap_to_dst.srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
-    swap_to_dst.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    swap_to_dst.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
-    swap_to_dst.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-    swap_to_dst.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    swap_to_dst.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    swap_to_dst.image = swap_image;
-    swap_to_dst.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-
-    VkImageMemoryBarrier pre_copy[2] = {mid_to_copy, swap_to_dst};
     devfn<PFN_vkCmdPipelineBarrier>(ds, "vkCmdPipelineBarrier")(
-        cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
-        0, 0, nullptr, 0, nullptr, 2, pre_copy);
+        cmd, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+        0, 0, nullptr, 0, nullptr, 1, &to_dst);
 
     VkImageCopy region{};
     region.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
@@ -1058,32 +1210,39 @@ VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL hexscale_vkCreateSwapchainKHR(
         if (dit != g_devices.end()) ds = dit->second;
     }
 
-    // Only RGBA8 (linear or sRGB) swapchains can go through the CAS pass;
-    // everything else (BGRA, 16-bit formats...) is left untouched.
+    // Any 4x8 UNORM/SRGB format goes through the CAS pass (the fragment
+    // path samples via native-format views); anything else stays untouched.
     const bool format_ok = pCreateInfo->imageFormat == VK_FORMAT_R8G8B8A8_UNORM ||
-                           pCreateInfo->imageFormat == VK_FORMAT_R8G8B8A8_SRGB;
+                           pCreateInfo->imageFormat == VK_FORMAT_R8G8B8A8_SRGB ||
+                           pCreateInfo->imageFormat == VK_FORMAT_B8G8R8A8_UNORM ||
+                           pCreateInfo->imageFormat == VK_FORMAT_B8G8R8A8_SRGB;
 
     PFN_vkCreateSwapchainKHR next_create =
         next_gdpa ? (PFN_vkCreateSwapchainKHR)next_gdpa(device, "vkCreateSwapchainKHR") : nullptr;
     if (!next_create) return VK_ERROR_INITIALIZATION_FAILED;
 
     if (!g_config.enabled || !ds || !format_ok) {
+        if (g_config.debug && !format_ok) {
+            HEX_LOG("swapchain format %u unsupported -> passthrough",
+                    static_cast<uint32_t>(pCreateInfo->imageFormat));
+        }
         return next_create(device, pCreateInfo, pAllocator, pSwapchain);
     }
 
     if (ds->pipeline == VK_NULL_HANDLE && !ds->pipeline_failed) {
         if (!create_cas_pipeline(ds)) {
             ds->pipeline_failed = true; // inert for this device, fail-open
+            HEX_LOG("pipeline creation failed -> layer inert on this device");
         }
     }
     if (ds->pipeline == VK_NULL_HANDLE) {
         return next_create(device, pCreateInfo, pAllocator, pSwapchain);
     }
 
-    // Request the extra usage the pass needs (storage reads + copy back).
+    // Request the extra usage the pass needs (sampling + copy back).
     // Apps lose nothing; if the driver refuses, retry the original info.
     VkSwapchainCreateInfoKHR patched = *pCreateInfo;
-    patched.imageUsage |= VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    patched.imageUsage |= VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
 
     VkResult res = next_create(device, &patched, pAllocator, pSwapchain);
     if (res != VK_SUCCESS || !pSwapchain || !*pSwapchain) {
@@ -1100,7 +1259,6 @@ VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL hexscale_vkCreateSwapchainKHR(
         (PFN_vkGetSwapchainImagesKHR)next_gdpa(device, "vkGetSwapchainImagesKHR");
 
     uint32_t count = 0;
-    bool tracked = false;
     if (get_images && get_images(device, *pSwapchain, &count, nullptr) == VK_SUCCESS &&
         count > 0 && count <= kMaxSwapchainImages &&
         get_images(device, *pSwapchain, &count, sc->images) == VK_SUCCESS) {
@@ -1112,9 +1270,7 @@ VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL hexscale_vkCreateSwapchainKHR(
     {
         std::lock_guard<std::mutex> lock(g_lock);
         g_swapchains[*pSwapchain] = sc; // usable=false -> passthrough
-        tracked = true;
     }
-    (void)tracked;
     return res;
 }
 
